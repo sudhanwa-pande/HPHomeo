@@ -1,0 +1,43 @@
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.pytest_cache/
+
+# ─── Dependencies ────────────────────────────────────────────────────────────
+node_modules/
+
+# ─── Environment ─────────────────────────────────────────────────────────────
+# .env contains live secrets; .env.example is the schema and SHOULD ship.
+.env
+.env.*
+!.env.example
+
+# ─── Logs & runtime artifacts ────────────────────────────────────────────────
+*.log
+
+# ─── Local binaries ──────────────────────────────────────────────────────────
+*.exe
+.ngrok.exe.old
+
+# ─── Test output / debug artifacts (contain JWTs and PII) ────────────────────
+hard_test_*.json
+demo_seed_report.json
+test_cloudinary.py
+
+# ─── Excluded from initial deploy (re-include if you set up CI later) ────────
+# These contain no secrets but aren't needed at runtime. Keeping them out of
+# the public repo for now.
+tests/
+scripts/
+pytest.ini
+
+# ─── IDE ─────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+
+# ─── AI tool temp ────────────────────────────────────────────────────────────
+.codex-temp/

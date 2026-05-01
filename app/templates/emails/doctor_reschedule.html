@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Appointment Rescheduled</title>
+</head>
+<body style="margin:0;padding:0;background-color:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" role="presentation">
+    <tr>
+      <td align="center" style="padding:40px 16px;">
+        <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="max-width:560px;">
+          <tr>
+            <td style="background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 1px 4px rgba(15,23,42,0.08),0 4px 20px rgba(15,23,42,0.05);">
+              <table width="100%" cellpadding="0" cellspacing="0" role="presentation">
+                <tr>
+                  <td style="padding:20px 32px 16px;background:#ffffff;border-bottom:1px solid #f1f5f9;">
+                    <img src="{{ logo_src }}" alt="HPHomeo" height="28" style="display:block;height:28px;width:auto;border:0;" />
+                  </td>
+                </tr>
+                <tr>
+                  <td style="background:linear-gradient(135deg,#4338ca,#4f46e5);padding:18px 32px;">
+                    <p style="margin:0;font-size:13px;font-weight:600;color:rgba(255,255,255,0.9);letter-spacing:0.1px;">Appointment Rescheduled</p>
+                  </td>
+                </tr>
+              </table>
+              <table width="100%" cellpadding="0" cellspacing="0" role="presentation">
+                <tr>
+                  <td style="padding:32px 32px 20px;">
+                    <h1 style="margin:0 0 6px;font-size:22px;font-weight:700;color:#0f172a;letter-spacing:-0.4px;">An appointment has been rescheduled</h1>
+                    <p style="margin:0;font-size:14px;line-height:1.65;color:#64748b;">The appointment below has been moved to a new time{% if rescheduled_by %} by the {{ rescheduled_by }}{% endif %}.</p>
+                  </td>
+                </tr>
+
+                <!-- Patient info -->
+                <tr>
+                  <td style="padding:0 32px 8px;">
+                    <p style="margin:0;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.8px;color:#94a3b8;">Patient</p>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:0 32px 20px;">
+                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;">
+                      <tr>
+                        <td style="padding:12px 16px;border-bottom:1px solid #f1f5f9;background:#f8fafc;">
+                          <p style="margin:0;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.7px;color:#94a3b8;">Name</p>
+                          <p style="margin:3px 0 0;font-size:15px;font-weight:600;color:#0f172a;">{{ patient_name }}</p>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding:12px 16px;{% if patient_email %}border-bottom:1px solid #f1f5f9;{% endif %}">
+                          <p style="margin:0;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.7px;color:#94a3b8;">Phone</p>
+                          <p style="margin:3px 0 0;font-size:15px;font-weight:600;color:#0f172a;">{{ patient_phone }}</p>
+                        </td>
+                      </tr>
+                      {% if patient_email %}
+                      <tr>
+                        <td style="padding:12px 16px;background:#f8fafc;">
+                          <p style="margin:0;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.7px;color:#94a3b8;">Email</p>
+                          <p style="margin:3px 0 0;font-size:15px;font-weight:600;color:#0f172a;">{{ patient_email }}</p>
+                        </td>
+                      </tr>
+                      {% endif %}
+                    </table>
+                  </td>
+                </tr>
+
+                <!-- Schedule change -->
+                <tr>
+                  <td style="padding:0 32px 8px;">
+                    <p style="margin:0;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.8px;color:#94a3b8;">Schedule Change</p>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:0 32px 24px;">
+                    <table width="100%" cellpadding="0" cellspacing="0" role="presentation" style="border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;">
+                      <tr>
+                        <td style="padding:12px 16px;border-bottom:1px solid #f1f5f9;background:#fef9f9;">
+                          <p style="margin:0;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.7px;color:#94a3b8;">Previous Time</p>
+                          <p style="margin:3px 0 0;font-size:15px;font-weight:600;color:#9ca3af;text-decoration:line-through;">{{ old_scheduled_at }}</p>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding:12px 16px;border-bottom:1px solid #f1f5f9;background:#f5f3ff;">
+                          <p style="margin:0;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.7px;color:#94a3b8;">New Time</p>
+                          <p style="margin:3px 0 0;font-size:15px;font-weight:700;color:#4f46e5;">{{ new_scheduled_at }}</p>
+                        </td>
+                      </tr>
+                      <tr>
+                        <td style="padding:12px 16px;{% if reschedule_reason %}border-bottom:1px solid #f1f5f9;{% endif %}background:#f8fafc;">
+                          <p style="margin:0;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.7px;color:#94a3b8;">Mode / Payment</p>
+                          <p style="margin:3px 0 0;font-size:15px;font-weight:600;color:#0f172a;">{{ mode | title }} · {{ payment_status | title }}</p>
+                        </td>
+                      </tr>
+                      {% if reschedule_reason %}
+                      <tr>
+                        <td style="padding:12px 16px;">
+                          <p style="margin:0;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.7px;color:#94a3b8;">Reason</p>
+                          <p style="margin:3px 0 0;font-size:14px;font-weight:500;color:#374151;">{{ reschedule_reason }}</p>
+                        </td>
+                      </tr>
+                      {% endif %}
+                    </table>
+                  </td>
+                </tr>
+
+                {% if doctor_link %}
+                <tr>
+                  <td style="padding:0 32px 32px;">
+                    <a href="{{ doctor_link }}" style="display:inline-block;background:#4f46e5;color:#ffffff;text-decoration:none;padding:13px 28px;border-radius:9px;font-size:14px;font-weight:600;letter-spacing:-0.1px;">View New Appointment &rarr;</a>
+                    <p style="margin:12px 0 0;font-size:12px;color:#94a3b8;">New ID: {{ new_appointment_id }} · Old ID: {{ old_appointment_id }}</p>
+                  </td>
+                </tr>
+                {% else %}
+                <tr>
+                  <td style="padding:0 32px 32px;">
+                    <p style="margin:0;font-size:12px;color:#94a3b8;">New ID: {{ new_appointment_id }} · Old ID: {{ old_appointment_id }}</p>
+                  </td>
+                </tr>
+                {% endif %}
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:20px 0 0;text-align:center;">
+              <p style="margin:0;font-size:12px;color:#94a3b8;">© 2026 HPHomeo · All rights reserved</p>
+              <p style="margin:4px 0 0;font-size:12px;color:#cbd5e1;">This is an automated message. Please do not reply.</p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

@@ -1,0 +1,28 @@
+venv
+node_modules
+.pytest_cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.git
+.idea
+.vscode
+.env
+.env.*
+# Dev tools
+ngrok.exe
+*.exe
+.ngrok.exe.old
+# Test artifacts
+*.json
+# Dev temp files
+.codex-temp/
+# Local logs
+*.log
+uvicorn.err.log
+uvicorn.out.log
+# Docker local dev only
+docker-compose.yml
+# Docs
+*.md

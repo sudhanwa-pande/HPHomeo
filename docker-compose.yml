@@ -1,0 +1,72 @@
+services:
+  mongodb:
+    image: mongo:7
+    container_name: mongodb-dev
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis-dev
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  celery_worker:
+    build: .
+    command: celery -A app.worker.celery_app worker --loglevel=info --queues=default,dlq_v1
+    depends_on:
+      - redis
+      - mongodb
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    restart: unless-stopped
+
+  celery_beat:
+    build: .
+    command: celery -A app.worker.celery_app beat --loglevel=info
+    depends_on:
+      - redis
+      - mongodb
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    restart: unless-stopped
+
+  flower:
+    build: .
+    command: celery -A app.worker.celery_app flower --port=5555
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+    env_file: .env
+    profiles:
+      - debug
+
+volumes:
+  mongo_data:
+    name: mongo_data
+  redis_data:
+    name: redis_data
