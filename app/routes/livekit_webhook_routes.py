@@ -13,6 +13,7 @@ Events handled:
 All handlers are idempotent — safe for retries and out-of-order delivery.
 """
 
+import base64
 import hashlib
 import json
 import logging
@@ -39,14 +40,17 @@ def _get_webhook_secret() -> str:
 def _verify_livekit_webhook(body: bytes, auth_header: str | None) -> dict:
     """Verify LiveKit webhook signature and return the decoded payload.
 
-    LiveKit sends a JWT in the Authorization: Bearer <token> header.
-    The JWT is signed with the API secret (HS256). The body's SHA-256
-    must match the `sha256` claim in the token.
+    LiveKit sends the JWT as the raw Authorization header value (no "Bearer "
+    prefix — see livekit/server-sdk-* across Go/JS/Python). The JWT is signed
+    with the API secret (HS256), and the body's SHA-256 hash is **base64-
+    encoded** (not hex) and stored in the `sha256` claim.
     """
-    if not auth_header or not auth_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    if not auth_header:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
 
-    token = auth_header[7:]  # strip "Bearer "
+    # Accept both raw JWT and "Bearer <jwt>" — LiveKit sends raw, but allow
+    # Bearer for forward-compatibility / proxies that might add it.
+    token = auth_header[7:] if auth_header.startswith("Bearer ") else auth_header
     secret = _get_webhook_secret()
 
     if not secret:
@@ -71,12 +75,16 @@ def _verify_livekit_webhook(body: bytes, auth_header: str | None) -> dict:
         )
         raise HTTPException(status_code=401, detail="Invalid webhook issuer")
 
-    # Verify body hash
+    # Verify body hash — LiveKit base64-encodes the SHA-256 (standard with
+    # padding), NOT hex. Compare in base64 to match.
     expected_hash = decoded.get("sha256")
     if expected_hash:
-        actual_hash = hashlib.sha256(body).hexdigest()
+        actual_hash = base64.b64encode(hashlib.sha256(body).digest()).decode()
         if actual_hash != expected_hash:
-            logger.warning("LiveKit webhook: body hash mismatch")
+            logger.warning(
+                "LiveKit webhook: body hash mismatch expected=%s got=%s",
+                expected_hash, actual_hash,
+            )
             raise HTTPException(status_code=401, detail="Body hash mismatch")
 
     return decoded
