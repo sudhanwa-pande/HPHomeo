@@ -144,7 +144,15 @@ async def notify_appointment(appointment_id: str, event_type: str, data: dict[st
 # Each SSE stream increments on enter, decrements on exit.
 # This prevents one user with many tabs from exhausting the pool.
 
-MAX_SSE_PER_CHANNEL = 2  # max concurrent SSE connections per channel
+MAX_SSE_PER_CHANNEL = 10  # max concurrent SSE connections per channel
+# Why 10 (was 2): the previous limit was too tight for normal browser behavior.
+# Tab switches, refreshes, and network blips create transient "zombie"
+# connections that take a few seconds for the server to detect. With multiple
+# uvicorn workers each tracking their own counter, the effective per-user cap
+# was being hit during routine reconnects, surfacing as "Offline" badges and
+# 429 storms in the SSE stream. 10 gives headroom for these transients while
+# still preventing a single user from monopolizing the 200-slot Redis pubsub
+# pool defined in app/core/redis.py.
 
 _sse_connections: dict[str, int] = {}
 _sse_lock = asyncio.Lock()
