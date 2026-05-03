@@ -130,7 +130,10 @@ class Settings(BaseSettings):
     COOKIE_SECURE: bool = True
     COOKIE_SAMESITE: Literal["lax", "strict", "none"] = "lax"
     PUBLIC_PATIENT_ACCESS_COOKIE_NAME: str = "public_patient_access_token"
-    PUBLIC_PATIENT_ACCESS_COOKIE_PATH: str = "/api/v1/public"
+    # Path "/" so the cookie is sent on BOTH /api/v1/public/* (direct API) AND
+    # /api/sse/* (the SSE streaming proxy on the frontend). Narrower paths break
+    # SSE because the browser drops the cookie on path mismatch.
+    PUBLIC_PATIENT_ACCESS_COOKIE_PATH: str = "/"
     
     # Business Logic
     PAYMENT_HOLD_MINUTES: int = 10

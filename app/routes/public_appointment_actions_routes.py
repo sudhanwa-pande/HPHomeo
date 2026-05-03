@@ -94,6 +94,49 @@ async def create_public_appointment_access_session(
     }
 
 
+@router.post(
+    "/access-by-token",
+    dependencies=[rl(settings.RL_PUBLIC_ACTION_TIMES, settings.RL_PUBLIC_ACTION_SECONDS)],
+)
+async def access_by_token(payload: PublicAppointmentAccessIn, response: Response):
+    """Token-only magic link landing.
+
+    Looks up the appointment by hashing the supplied magic token and matching
+    against `patient_access_token_hash`, sets the public-patient access cookie,
+    and returns the appointment id so the frontend can redirect.
+
+    Used by WhatsApp template buttons where Meta URL-encodes the dynamic
+    substitution — the static URL `/m/{{1}}` plus the URL-safe token works
+    around that, since the token only contains [A-Za-z0-9_-].
+    """
+    db = get_db()
+    token = (payload.token or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="Token required")
+
+    token_hash = hash_magic_token(token)
+    appt = await db.appointments.find_one(
+        {"patient_access_token_hash": token_hash},
+        {"_id": 1, "patient_access_expires_at": 1},
+    )
+    if not appt:
+        raise HTTPException(status_code=404, detail="Invalid or revoked link")
+
+    now = utc_now()
+    expires_at = ensure_utc(appt.get("patient_access_expires_at"))
+    if not expires_at or expires_at <= now:
+        raise HTTPException(status_code=403, detail="Link expired")
+
+    max_age = max(1, int((expires_at - now).total_seconds()))
+    set_public_patient_access_cookie(response, token=token, max_age=max_age)
+
+    return {
+        "message": "access_session_created",
+        "appointment_id": str(appt["_id"]),
+        "expires_at": expires_at.isoformat(),
+    }
+
+
 @router.get(
     "/appointments/{appointment_id}",
     response_model=PublicAppointmentView,

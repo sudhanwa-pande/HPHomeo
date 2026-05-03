@@ -207,17 +207,19 @@ def _resolve_patient_access_token(appointment: dict) -> str | None:
 
 
 def _appointment_link_suffix(appointment: dict) -> str:
-    appointment_id = str(appointment.get("_id") or "").strip()
-    if not appointment_id:
-        raise ValueError("Appointment id is required for WhatsApp button links")
+    """Token-only suffix for WhatsApp button URL.
 
+    Meta URL-encodes the dynamic substitution in template buttons, so any
+    "/" or "#" in the value gets mangled. We pass just the magic token (which
+    only uses URL-safe chars from secrets.token_urlsafe) and the WhatsApp
+    template's static URL points at https://<frontend>/m/{{1}} — a frontend
+    redirect page that calls /public/access-by-token to set the cookie and
+    forwards the patient to the appointment view.
+    """
     token = _resolve_patient_access_token(appointment)
     if not token:
         raise ValueError("Patient access token is required for WhatsApp button links")
-
-    prefix = str(settings.WHATSAPP_PUBLIC_APPOINTMENT_PATH_PREFIX or "").strip().strip("/")
-    base = f"{prefix}/{appointment_id}" if prefix else appointment_id
-    return f"{base}#pat={token}"
+    return token
 
 
 async def send_patient_appointment_confirmation_whatsapp(
