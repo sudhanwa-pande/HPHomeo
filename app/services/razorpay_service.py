@@ -1,9 +1,13 @@
 import asyncio
 import logging
+import time
 import uuid
+from http.client import RemoteDisconnected
 
 import razorpay
 from razorpay.errors import BadRequestError, ServerError, SignatureVerificationError
+from requests.exceptions import ConnectionError
+from urllib3.exceptions import ProtocolError
 from fastapi import HTTPException
 
 from app.core.config import settings
@@ -26,22 +30,33 @@ def _create_order_sync(amount_paise: int, appointment_id: str) -> dict:
         raise HTTPException(status_code=400, detail="Invalid appointment_id")
 
     receipt = f"appt_{appointment_id}_{uuid.uuid4().hex[:8]}"
-    try:
-        return client.order.create({
-            "amount": amount_paise,
-            "currency": "INR",
-            "receipt": receipt,
-            "payment_capture": 1,  # auto capture — verify against your account setup
-        })
-    except BadRequestError:
-        logger.exception("Razorpay create_order bad request")
-        raise HTTPException(status_code=400, detail="Payment order creation failed")
-    except ServerError:
-        logger.exception("Razorpay create_order server error")
-        raise HTTPException(status_code=502, detail="Payment provider unavailable, try again")
-    except Exception:
-        logger.exception("Razorpay create_order unexpected error")
-        raise HTTPException(status_code=500, detail="Payment order creation failed")
+    
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            return client.order.create({
+                "amount": amount_paise,
+                "currency": "INR",
+                "receipt": receipt,
+                "payment_capture": 1,  # auto capture — verify against your account setup
+            })
+        except (ConnectionError, ProtocolError, RemoteDisconnected) as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"Razorpay connection failed (attempt {attempt + 1}). Retrying...")
+                time.sleep(1)  # Wait 1 second before retrying
+                continue
+            else:
+                logger.error("Razorpay connection failed after max retries.")
+                raise  # Finally give up and let Sentry catch it
+        except BadRequestError:
+            logger.exception("Razorpay create_order bad request")
+            raise HTTPException(status_code=400, detail="Payment order creation failed")
+        except ServerError:
+            logger.exception("Razorpay create_order server error")
+            raise HTTPException(status_code=502, detail="Payment provider unavailable, try again")
+        except Exception:
+            logger.exception("Razorpay create_order unexpected error")
+            raise HTTPException(status_code=500, detail="Payment order creation failed")
 
 
 async def create_order(amount_paise: int, appointment_id: str) -> dict:
