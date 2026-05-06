@@ -215,7 +215,16 @@ async def _attempt_refund_for_appointment(
             },
         )
         appt["refund_status"] = "failed" if terminal_failure else "pending"
-        logger.exception("Refund failed for appointment_id=%s: %s", appt["_id"], exc)
+        logger.exception(
+            "Refund failed for appointment_id=%s: %s",
+            appt["_id"],
+            exc,
+            extra={
+                "appointment_id": str(appt["_id"]),
+                "payment_id": appt.get("payment_id"),
+                "refund_id": appt.get("refund_id"),
+            }
+        )
         await _invalidate_refund_related_caches(appt)
         return False
 
@@ -504,6 +513,7 @@ async def process_pending_refunds(self):
     retry_backoff=True,
     retry_backoff_max=300,
     retry_jitter=True,
+    rate_limit="10/m",
 )
 @async_task
 async def process_refund_for_appointment(appointment_id: str):
@@ -532,18 +542,7 @@ async def process_refund_for_appointment(appointment_id: str):
         logger.info("process_refund_for_appointment: initiated appointment_id=%s", appointment_id)
         return
 
-    if appt.get("refund_status") == "processing" and appt.get("refund_id"):
-        reconciled_processed, reconciled_failed = await _reconcile_stale_processing_refunds(
-            db,
-            now=now,
-            processing_stale_before=processing_stale_before,
-        )
-        logger.info(
-            "process_refund_for_appointment: reconciled appointment_id=%s processed=%d failed=%d",
-            appointment_id,
-            reconciled_processed,
-            reconciled_failed,
-        )
+
 
 
 @celery_app.task(

@@ -50,6 +50,8 @@ celery_app.conf.update(
     task_always_eager=settings.CELERY_TASK_ALWAYS_EAGER,
     task_queues=(
         Queue("default", exchange=default_exchange, routing_key="default"),
+        Queue("payments", exchange=default_exchange, routing_key="payments"),
+        Queue("notifications", exchange=default_exchange, routing_key="notifications"),
         Queue(DLQ_QUEUE_NAME, exchange=dlq_exchange, routing_key="dlq"),
     ),
     task_default_queue="default",
@@ -61,6 +63,22 @@ celery_app.conf.update(
             "queue": DLQ_QUEUE_NAME,
             "exchange": "dlq",
             "routing_key": "dlq",
+        },
+        "app.worker.tasks.appointment_tasks.process_refund_for_appointment": {
+            "queue": "payments",
+            "routing_key": "payments",
+        },
+        "app.worker.tasks.appointment_tasks.process_pending_refunds": {
+            "queue": "payments",
+        },
+        "app.worker.tasks.appointment_tasks.reconcile_captured_payments": {
+            "queue": "payments",
+        },
+        "app.worker.tasks.appointment_tasks.send_24hr_reminder_emails": {
+            "queue": "notifications",
+        },
+        "app.worker.tasks.appointment_tasks.send_12hr_whatsapp_reminders": {
+            "queue": "notifications",
         },
         "app.worker.tasks.*": {
             "queue": "default",

@@ -164,25 +164,24 @@ async def _handle_payment_captured(payload: dict):
     # ---------------------------
     expected_fee = appt.get("consultation_fee")
     if amount_paise is None:
-        logger.error(
+        logger.critical(
             "payment.captured: missing amount in webhook payload for appointment_id=%s "
             "payment_id=%s — rejecting",
             appt_id, payment_id,
+            extra={"appointment_id": str(appt_id), "payment_id": payment_id}
         )
-        raise Exception(f"Missing amount in payment.captured payload for appointment_id={appt_id}")
+        return {"status": "missing_amount_ignored"}
 
     if expected_fee is not None:
         expected_paise = int(expected_fee) * 100
         if int(amount_paise) != expected_paise:
-            logger.error(
+            logger.critical(
                 "payment.captured: AMOUNT MISMATCH appointment_id=%s "
                 "expected_paise=%s received_paise=%s payment_id=%s — rejecting",
                 appt_id, expected_paise, amount_paise, payment_id,
+                extra={"appointment_id": str(appt_id), "payment_id": payment_id}
             )
-            raise Exception(
-                f"Amount mismatch for appointment_id={appt_id}: "
-                f"expected {expected_paise} paise, received {amount_paise} paise"
-            )
+            return {"status": "amount_mismatch_ignored"}
 
     update_set = {
         "status": "confirmed",
@@ -204,6 +203,40 @@ async def _handle_payment_captured(payload: dict):
     )
 
     if update_res.modified_count == 0:
+        current_appt = await db.appointments.find_one({"_id": appt_id})
+        if current_appt and current_appt.get("status") == "cancelled":
+            logger.critical(
+                "payment.captured: appointment_id=%s is cancelled but payment was captured! "
+                "Triggering auto-refund.",
+                appt_id,
+            )
+            from app.services.refund_service import enqueue_refund_processing
+            
+            fallback_res = await db.appointments.update_one(
+                {
+                    "_id": appt_id,
+                    "status": "cancelled",
+                    "payment_status": {"$ne": "paid"}
+                },
+                {
+                    "$set": {
+                        "payment_status": "paid",
+                        "payment_provider": "razorpay",
+                        "payment_id": payment_id,
+                        "payment_amount_paise": amount_paise,
+                        "updated_at": now,
+                    }
+                }
+            )
+            if fallback_res.modified_count > 0:
+                enqueued = enqueue_refund_processing(str(appt_id))
+                if not enqueued:
+                    logger.critical(
+                        "payment.captured: Failed to enqueue auto-refund for cancelled appointment_id=%s",
+                        appt_id,
+                    )
+                return {"status": "refund_triggered"}
+                
         logger.warning(
             "payment.captured: could not update appointment_id=%s — already modified",
             appt_id,
@@ -373,7 +406,7 @@ async def _handle_refund_processed(payload: dict):
 
     # Guard: refund webhook should apply only to appointment that currently owns this payment.
     if not appt.get("payment_id") or appt.get("payment_id") != payment_id:
-        logger.warning("refund.processed: payment ownership mismatch for appointment_id=%s", appt_id)
+        logger.warning("refund.processed: payment ownership mismatch for appointment_id=%s", appt_id, extra={"appointment_id": str(appt_id), "payment_id": payment_id})
         return
     if appt.get("payment_status") == "transferred":
         logger.warning("refund.processed: ignoring transferred payment for appointment_id=%s", appt_id)
@@ -431,7 +464,7 @@ async def _handle_refund_failed(payload: dict):
 
     appt_id = appt["_id"]
     if not appt.get("payment_id") or appt.get("payment_id") != payment_id:
-        logger.warning("refund.failed: payment ownership mismatch for appointment_id=%s", appt_id)
+        logger.warning("refund.failed: payment ownership mismatch for appointment_id=%s", appt_id, extra={"appointment_id": str(appt_id), "payment_id": payment_id})
         return
     if appt.get("payment_status") == "transferred":
         logger.warning("refund.failed: ignoring transferred payment for appointment_id=%s", appt_id)
@@ -455,7 +488,7 @@ async def _handle_refund_failed(payload: dict):
     )
 
     await db.appointments.update_one(
-        {"_id": appt_id},
+        {"_id": appt_id, "refund_status": {"$ne": "processed"}},
         {
             "$set": {
                 "refund_status": "failed",

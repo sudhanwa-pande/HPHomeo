@@ -127,6 +127,17 @@ async def connect_db():
     )
     # Video call lifecycle queries (optional global ops)
     await _db.appointments.create_index("call_status", sparse=True)
+    
+    # Refund lookup
+    await _db.appointments.create_index(
+        [("refund_id", 1)],
+        sparse=True,
+    )
+    
+    # Doctor scheduling timeline queries
+    await _db.appointments.create_index(
+        [("doctor_id", 1), ("scheduled_at", -1)]
+    )
 
     # Magic token lookups (hashed storage)
     try:
