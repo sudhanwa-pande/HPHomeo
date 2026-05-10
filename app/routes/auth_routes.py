@@ -579,7 +579,9 @@ async def validate_login_totp(request: Request, response: Response, payload: Log
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid TOTP setup state")
 
-    if not pyotp.TOTP(secret).verify(payload.code, valid_window=1):
+    totp = pyotp.TOTP(secret)
+
+    if not totp.verify(payload.code, valid_window=1):
         attempts = await increment_attempts(channel="totp", identity=doctor_id, purpose=purpose)
         if is_locked(attempts):
             raise HTTPException(
@@ -732,8 +734,27 @@ async def enable_totp(request: Request, payload: TotpEnableIn, current=Depends(g
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid TOTP setup state")
 
-    if not pyotp.TOTP(secret).verify(payload.code, valid_window=1):
+    doctor_id = str(current["_id"])
+    purpose = "totp_setup"
+    attempts = await get_attempts(channel="totp", identity=doctor_id, purpose=purpose)
+    if is_locked(attempts):
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many invalid TOTP attempts. Try again later (max {OTP_MAX_ATTEMPTS}).",
+        )
+
+    totp = pyotp.TOTP(secret)
+
+    if not totp.verify(payload.code, valid_window=1):
+        attempts = await increment_attempts(channel="totp", identity=doctor_id, purpose=purpose)
+        if is_locked(attempts):
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many invalid TOTP attempts. Try again later (max {OTP_MAX_ATTEMPTS}).",
+            )
         raise HTTPException(status_code=400, detail="Invalid TOTP code")
+
+    await clear_otp(channel="totp", identity=doctor_id, purpose=purpose)
 
     await db.doctors.update_one(
         {"_id": current["_id"]},

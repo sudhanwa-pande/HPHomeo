@@ -134,6 +134,9 @@ def _appt_to_patient_out(a: dict) -> dict:
 
         # ✅ Reminder preferences
         "reminder_preferences": _reminder_prefs_out(a.get("reminder_preferences")),
+
+        # ✅ Creation timestamp (for 'Booked On' display)
+        "created_at": ensure_utc(a.get("created_at")).isoformat() if a.get("created_at") else None,
     }
 
 

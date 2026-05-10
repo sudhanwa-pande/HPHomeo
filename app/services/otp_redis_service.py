@@ -7,8 +7,8 @@ from app.core.redis_keys import (
 )
 
 OTP_TTL_SECONDS = 300
-OTP_ATTEMPTS_TTL_SECONDS = 300
-OTP_MAX_ATTEMPTS = 5
+OTP_ATTEMPTS_TTL_SECONDS = 300  # Lockout duration: 5 minutes
+OTP_MAX_ATTEMPTS = 3            # Tightened for production security (especially TOTP)
 
 # Atomically GET the OTP hash then immediately DELETE it so the key cannot be
 # reused in a concurrent request between the caller's GET and its own DEL.

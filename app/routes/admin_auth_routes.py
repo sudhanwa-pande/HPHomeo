@@ -18,10 +18,18 @@ from app.core.token_blacklist import is_token_blacklisted
 from app.services.audit_service import log_audit
 from app.services.cache_service import invalidate_doctor_cache
 from app.utils.time import utc_now
+from app.services.otp_redis_service import (
+    OTP_MAX_ATTEMPTS,
+    clear_otp,
+    get_attempts,
+    increment_attempts,
+    is_locked,
+)
 
 router = APIRouter(prefix="/admin/auth", tags=["Admin Auth"])
 
 ADMIN_SESSION_MINUTES = 30
+ADMIN_REAUTH_OTP_PURPOSE = "admin_reauth"
 
 
 async def verify_admin_session(
@@ -78,8 +86,27 @@ async def verify_admin_reauth(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid TOTP setup state")
 
-    if not pyotp.TOTP(secret).verify(payload.code, valid_window=1):
+    doctor_id = str(current["_id"])
+    purpose = ADMIN_REAUTH_OTP_PURPOSE
+    attempts = await get_attempts(channel="totp", identity=doctor_id, purpose=purpose)
+    if is_locked(attempts):
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many invalid TOTP attempts. Try again later (max {OTP_MAX_ATTEMPTS}).",
+        )
+
+    totp = pyotp.TOTP(secret)
+
+    if not totp.verify(payload.code, valid_window=1):
+        attempts = await increment_attempts(channel="totp", identity=doctor_id, purpose=purpose)
+        if is_locked(attempts):
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many invalid TOTP attempts. Try again later (max {OTP_MAX_ATTEMPTS}).",
+            )
         raise HTTPException(status_code=401, detail="Invalid TOTP code")
+
+    await clear_otp(channel="totp", identity=doctor_id, purpose=purpose)
 
     token = create_access_token(
         {
