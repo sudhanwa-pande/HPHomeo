@@ -589,8 +589,8 @@ async def cleanup_stale_video_rooms():
     Handles two cases:
     1. Disconnected calls that exceeded the timeout (Redis key expired but
        Celery didn't fire in time — safety net).
-    2. Calls stuck in waiting/connected for >2 hours (zombie calls from
-       missed webhooks).
+    2. Calls stuck in waiting/connected for >15 minutes (zombie calls from
+       missed webhooks or abandoned sessions).
     """
     db = await get_task_db()
     now = utc_now()
@@ -606,7 +606,8 @@ async def cleanup_stale_video_rooms():
         {
             "$set": {
                 "call_status": "ended",
-                "call_participants": [],
+                "patient_participant": None,
+                "doctor_participant": None,
                 "call_participant_count": 0,
                 "call_ended_at": now,
                 "updated_at": now,
@@ -614,8 +615,8 @@ async def cleanup_stale_video_rooms():
         },
     )
 
-    # 2. Safety net: end zombie calls stuck for >2 hours
-    stale_cutoff = now - timedelta(hours=2)
+    # 2. Safety net: end zombie calls stuck for >15 minutes
+    stale_cutoff = now - timedelta(minutes=15)
     stale_result = await db.appointments.update_many(
         {
             "call_status": {"$in": ["waiting", "connected"]},
@@ -624,7 +625,8 @@ async def cleanup_stale_video_rooms():
         {
             "$set": {
                 "call_status": "ended",
-                "call_participants": [],
+                "patient_participant": None,
+                "doctor_participant": None,
                 "call_participant_count": 0,
                 "call_ended_at": now,
                 "updated_at": now,

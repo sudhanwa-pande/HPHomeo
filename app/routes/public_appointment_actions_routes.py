@@ -231,10 +231,16 @@ async def public_video_token(
     appointment_id: str,
     token: str = Depends(get_patient_access_token),
 ):
+    import logging
+    import uuid
+    from app.services.cache_service import invalidate_doctor_cache, invalidate_patient_cache
+    from app.utils.time import ensure_utc
+    logger = logging.getLogger(__name__)
+
     """Generate a LiveKit token for a public (unauthenticated) patient.
 
-    Token generation does NOT change call state — state transitions happen
-    only via LiveKit webhooks when participants actually join the room.
+    Token generation acts as a soft state transition. Webhooks are the primary
+    source of truth for state.
     """
     if not settings.VIDEO_ENABLED:
         raise HTTPException(status_code=503, detail="Video is disabled")
@@ -256,27 +262,58 @@ async def public_video_token(
     if appt.get("mode") != "online" or not appt.get("video_enabled", False):
         raise HTTPException(status_code=403, detail="Video is not enabled for this appointment")
 
+    if appt.get("status") != "confirmed":
+        raise HTTPException(status_code=409, detail="Invalid appointment state")
+        
+    if appt.get("call_status") == "ended":
+        raise HTTPException(status_code=409, detail="Call already ended")
+
     check_video_payment(appt, role="patient")
     check_join_window(appt, now, role="patient")
 
-    room = await ensure_video_room(db, appt)
+    # Participant limits
+    call_status = appt.get("call_status", "idle")
+    count = appt.get("call_participant_count", 0)
+    if call_status in ["waiting", "connected"]:
+        if count >= 2:
+            logger.warning("participant_limit_warning: count>=2 appointment_id=%s role=patient(public)", appointment_id)
+        if count >= 3:
+            logger.warning("participant_limit_breach: count>=3 appointment_id=%s role=patient(public)", appointment_id)
+            raise HTTPException(status_code=409, detail="Too many participants in the room")
 
-    # Record patient_joined_at for analytics (does not change call state)
+    # Token replay protection (burst limit)
+    last_issued = appt.get("patient_last_token_issued_at")
+    if last_issued and (now - ensure_utc(last_issued)).total_seconds() < 2:
+        logger.warning("token_replay_burst: appointment_id=%s role=patient(public)", appointment_id)
+
+    # Hard guarantee room reuse
+    if not appt.get("video_room"):
+        room = await ensure_video_room(db, appt)
+    else:
+        room = appt["video_room"]
+
+    # Record patient_joined_at for analytics only — does NOT change call state.
+    # State transitions happen only via LiveKit webhooks when participants actually join.
     await db.appointments.update_one(
-        {"_id": appt_oid, "patient_joined_at": None},
-        {"$set": {"patient_joined_at": now, "updated_at": now}},
+        {"_id": appt_oid},
+        {"$set": {"patient_joined_at": now, "patient_last_token_issued_at": now, "updated_at": now}},
     )
 
-    patient_phone = appt.get("patient_phone")
-    if not patient_phone:
-        raise HTTPException(status_code=400, detail="Patient phone is missing for this appointment")
+    trace_id = uuid.uuid4().hex
+    identity = f"patient:{appointment_id}"
+    logger.info("video_token_issued", extra={"appointment_id": appointment_id, "role": "patient", "identity": identity, "trace_id": trace_id, "public": True})
 
-    join_token = create_video_token(
-        room=room,
-        identity=f"patient:{patient_phone}",
-        metadata={"appointment_id": str(appt["_id"]), "role": "patient"},
-        ttl_seconds=settings.LIVEKIT_TOKEN_TTL_SECONDS,
-    )
+    try:
+        join_token = create_video_token(
+            room=room,
+            identity=identity,
+            metadata={"appointment_id": appointment_id, "role": "patient", "trace_id": trace_id},
+            ttl_seconds=7200, # 2 hours
+        )
+    except Exception as e:
+        logger.error("livekit_token_generation_failed", extra={"appointment_id": appointment_id, "role": "patient", "public": True, "error": str(e), "trace_id": trace_id})
+        raise HTTPException(status_code=500, detail="Failed to generate video token")
+
     return {
         "provider": "livekit",
         "server_url": settings.LIVEKIT_URL,

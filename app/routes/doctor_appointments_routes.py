@@ -588,7 +588,7 @@ async def get_appointment_detail(
         "call_participant_count": appt.get("call_participant_count", 0),
         "call_participants": [
             {"role": p.get("role"), "identity": p.get("identity")}
-            for p in (appt.get("call_participants") or [])
+            for p in [appt.get("patient_participant"), appt.get("doctor_participant")] if p
         ],
         "video_room": appt.get("video_room"),
         "confirmed_at": _iso_utc(appt.get("confirmed_at")),
@@ -635,6 +635,11 @@ async def doctor_video_token(
     appointment_id: str,
     doctor=Depends(get_current_doctor),
 ):
+    import logging
+    import uuid
+    from app.utils.video import check_join_window
+    logger = logging.getLogger(__name__)
+
     """Generate a LiveKit token for the doctor.
 
     Token generation does NOT change call state — state transitions happen
@@ -658,22 +663,58 @@ async def doctor_video_token(
     if appt.get("mode") != "online" or not appt.get("video_enabled", False):
         raise HTTPException(status_code=403, detail="Video is not enabled for this appointment")
 
-    check_video_payment(appt, role="doctor")
+    if appt.get("status") != "confirmed":
+        raise HTTPException(status_code=409, detail="Invalid appointment state")
+        
+    if appt.get("call_status") == "ended":
+        raise HTTPException(status_code=409, detail="Call already ended")
 
-    room = await ensure_video_room(db, appt)
+    check_video_payment(appt, role="doctor")
+    check_join_window(appt, now, role="doctor")
+
+    # Participant limits
+    call_status = appt.get("call_status", "idle")
+    count = appt.get("call_participant_count", 0)
+    if call_status in ["waiting", "connected"]:
+        if count >= 2:
+            logger.warning("participant_limit_warning: count>=2 appointment_id=%s role=doctor", appointment_id)
+        if count >= 3:
+            logger.warning("participant_limit_breach: count>=3 appointment_id=%s role=doctor", appointment_id)
+            raise HTTPException(status_code=409, detail="Too many participants in the room")
+
+    # Token replay protection (burst limit)
+    from app.utils.time import ensure_utc
+    last_issued = appt.get("doctor_last_token_issued_at")
+    if last_issued and (now - ensure_utc(last_issued)).total_seconds() < 2:
+        logger.warning("token_replay_burst: appointment_id=%s role=doctor", appointment_id)
+
+    # Hard guarantee room reuse
+    if not appt.get("video_room"):
+        room = await ensure_video_room(db, appt)
+    else:
+        room = appt["video_room"]
 
     # Record doctor_joined_at for analytics (does not change call state)
     await db.appointments.update_one(
-        {"_id": appt_oid, "doctor_joined_at": None},
-        {"$set": {"doctor_joined_at": now, "updated_at": now}},
+        {"_id": appt_oid},
+        {"$set": {"doctor_joined_at": now, "doctor_last_token_issued_at": now, "updated_at": now}},
     )
 
-    join_token = create_video_token(
-        room=room,
-        identity=f"doctor:{doctor['_id']}",
-        metadata={"appointment_id": str(appt["_id"]), "role": "doctor"},
-        ttl_seconds=settings.LIVEKIT_TOKEN_TTL_SECONDS,
-    )
+    trace_id = uuid.uuid4().hex
+    identity = f"doctor:{str(doctor['_id'])}"
+    logger.info("video_token_issued", extra={"appointment_id": appointment_id, "role": "doctor", "identity": identity, "trace_id": trace_id})
+
+    try:
+        join_token = create_video_token(
+            room=room,
+            identity=identity,
+            metadata={"appointment_id": str(appt["_id"]), "role": "doctor", "trace_id": trace_id},
+            ttl_seconds=7200, # 2 hours
+        )
+    except Exception as e:
+        logger.error("livekit_token_generation_failed", extra={"appointment_id": appointment_id, "role": "doctor", "error": str(e), "trace_id": trace_id})
+        raise HTTPException(status_code=500, detail="Failed to generate video token")
+
     return {
         "provider": "livekit",
         "server_url": settings.LIVEKIT_URL,

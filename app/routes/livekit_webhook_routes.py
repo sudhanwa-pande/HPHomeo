@@ -149,6 +149,15 @@ async def livekit_webhook(request: Request):
     participant_sid = participant.get("sid", "")
     metadata = participant.get("metadata")
 
+    trace_id = None
+    if metadata:
+        try:
+            meta = json.loads(metadata)
+            trace_id = meta.get("trace_id")
+        except Exception:
+            pass
+    trace_id = trace_id or "missing_trace"
+
     # Resolve appointment_id from metadata first, then room name
     appointment_id = _extract_appointment_id_from_metadata(metadata)
     if not appointment_id:
@@ -160,6 +169,7 @@ async def livekit_webhook(request: Request):
             return {"status": "ignored"}
 
         role = _extract_role_from_identity(identity)
+        logger.info("participant_joined webhook: appointment_id=%s role=%s trace_id=%s", appointment_id, role, trace_id)
         await handle_participant_joined(appointment_id, identity, role, participant_sid)
         return {"status": "ok"}
 
@@ -168,6 +178,8 @@ async def livekit_webhook(request: Request):
             logger.debug("LiveKit webhook: participant_left missing data, ignoring")
             return {"status": "ignored"}
 
+        role = _extract_role_from_identity(identity)
+        logger.info("participant_left webhook: appointment_id=%s role=%s trace_id=%s", appointment_id, role, trace_id)
         await handle_participant_left(appointment_id, identity, participant_sid)
         return {"status": "ok"}
 
@@ -175,6 +187,7 @@ async def livekit_webhook(request: Request):
         if not room_name:
             return {"status": "ignored"}
 
+        logger.info("room_finished webhook: room=%s appointment_id=%s trace_id=%s", room_name, appointment_id, trace_id)
         await handle_room_finished(room_name)
         return {"status": "ok"}
 

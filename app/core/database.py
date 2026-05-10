@@ -118,8 +118,7 @@ async def connect_db():
         sparse=True,
     )
     await _db.appointments.create_index(
-        [("call_status", 1), ("updated_at", 1)],
-        sparse=True,
+        [("call_status", 1), ("updated_at", 1)]
     )
     await _db.appointments.create_index(
         [("refund_status", 1), ("payment_id", 1)],

@@ -57,8 +57,11 @@ async def ensure_video_room(db, appointment: dict) -> str:
     if appointment.get("video_room"):
         return str(appointment["video_room"])
 
+    from pymongo import ReturnDocument
+    from app.utils.time import utc_now
+
     room_name = generate_room_name(str(appointment["_id"]))
-    await db.appointments.update_one(
+    updated = await db.appointments.find_one_and_update(
         {
             "_id": appointment["_id"],
             "$or": [
@@ -67,12 +70,33 @@ async def ensure_video_room(db, appointment: dict) -> str:
                 {"video_room": ""},
             ],
         },
-        {"$set": {"video_room": room_name, "video_provider": "livekit"}},
+        {"$set": {"video_room": room_name, "video_provider": "livekit", "updated_at": utc_now()}},
+        return_document=ReturnDocument.AFTER,
     )
-    updated = await db.appointments.find_one({"_id": appointment["_id"]}, {"video_room": 1})
-    if not updated or not updated.get("video_room"):
+
+    if updated and updated.get("video_room"):
+        room_name = str(updated["video_room"])
+        try:
+            from livekit import api
+            import logging
+            logger = logging.getLogger(__name__)
+            room_client = api.RoomService(settings.LIVEKIT_URL, settings.LIVEKIT_API_KEY, settings.LIVEKIT_API_SECRET.get_secret_value())
+            req = api.CreateRoomRequest(name=room_name, empty_timeout=5*60, max_participants=2)
+            await room_client.create_room(req)
+            await room_client.aclose()
+            logger.info("livekit_room_created", extra={"room": room_name, "max_participants": 2})
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error("livekit_room_creation_failed", extra={"room": room_name, "error": str(e)})
+
+        return room_name
+
+    # If another request already set it concurrently
+    appt_latest = await db.appointments.find_one({"_id": appointment["_id"]}, {"video_room": 1})
+    if not appt_latest or not appt_latest.get("video_room"):
         raise HTTPException(status_code=500, detail="Failed to initialize video room")
-    return str(updated["video_room"])
+    return str(appt_latest["video_room"])
 
 
 def check_video_payment(appointment: dict, role: str = "patient") -> None:

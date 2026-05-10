@@ -76,7 +76,6 @@ _VALID_TRANSITIONS: dict[tuple[str, str], set[str]] = {
     ("idle", "participant_joined"): {"waiting", "connected"},
     ("waiting", "participant_joined"): {"connected", "waiting"},
     ("disconnected", "participant_joined"): {"waiting", "connected"},
-    ("ended", "participant_joined"): {"waiting", "connected"},
     # participant_left events
     ("waiting", "participant_left"): {"idle", "waiting"},
     ("connected", "participant_left"): {"waiting", "disconnected"},
@@ -162,90 +161,101 @@ async def handle_participant_joined(
         logger.warning("handle_participant_joined: appointment not found id=%s", appointment_id)
         return None
 
-    current_state = appt.get("call_status", "idle")
-    participants = list(appt.get("call_participants") or [])
-
-    # Deduplicate: if this identity is already tracked, update their sid
-    existing_idx = None
-    for i, p in enumerate(participants):
-        if p.get("identity") == identity:
-            existing_idx = i
-            break
-
-    if existing_idx is not None:
-        participants[existing_idx]["sid"] = participant_sid
-        participants[existing_idx]["joined_at"] = now
-    else:
-        participants.append({
-            "identity": identity,
-            "role": role,
-            "sid": participant_sid,
-            "joined_at": now,
-        })
-
-    count = len(participants)
-    new_state = _derive_state_from_count(current_state, "participant_joined", count)
-    if new_state is None:
+    if appt.get("call_status") == "ended":
         return None
 
-    # Idempotent: if state hasn't changed and participant was already tracked, skip
-    if new_state == current_state and existing_idx is not None:
-        logger.debug(
-            "handle_participant_joined: no-op state=%s appointment_id=%s identity=%s",
-            current_state, appointment_id, identity,
+    current_state = appt.get("call_status", "idle")
+
+    # Status drift check
+    if appt.get("status") != "confirmed":
+        logger.warning(
+            "handle_participant_joined: status drift detected (status=%s). Ending call appointment_id=%s",
+            appt.get("status"), appointment_id,
         )
-        # Still update participant list (sid may have changed)
         await db.appointments.update_one(
             {"_id": appt_oid},
-            {"$set": {"call_participants": participants, "updated_at": now}},
+            {"$set": {"call_status": "ended", "updated_at": now}}
         )
+        await _emit_state_change(appt, "ended", 0, [], now)
         return None
 
-    if not _is_valid_transition(current_state, "participant_joined", new_state):
-        logger.warning(
-            "handle_participant_joined: invalid transition %s → %s for appointment_id=%s",
-            current_state, new_state, appointment_id,
-        )
-        return None
+    patient_p = appt.get("patient_participant")
+    doctor_p = appt.get("doctor_participant")
 
-    update_set: dict[str, Any] = {
-        "call_status": new_state,
-        "call_participants": participants,
-        "call_participant_count": count,
-        "updated_at": now,
+    if role == "patient" and patient_p:
+        if patient_p.get("sid") == participant_sid:
+            return None
+        logger.warning("Duplicate patient connection detected appointment_id=%s identity=%s", appointment_id, identity)
+    if role == "doctor" and doctor_p:
+        if doctor_p.get("sid") == participant_sid:
+            return None
+        logger.warning("Duplicate doctor connection detected appointment_id=%s identity=%s", appointment_id, identity)
+
+    participant_obj = {
+        "identity": identity,
+        "role": role,
+        "sid": participant_sid,
+        "joined_at": now,
     }
 
-    # Set call_connected_at on first connection
-    if new_state == "connected" and not appt.get("call_connected_at"):
-        update_set["call_connected_at"] = now
-
-    # Clear disconnect timeout if reconnecting
-    if current_state == "disconnected" and new_state in ("waiting", "connected"):
-        update_set["call_disconnected_at"] = None
-        redis = get_redis()
-        await redis.delete(_disconnect_key(appointment_id))
-
-    # Use atomic update with state guard for safety
-    result = await db.appointments.update_one(
-        {"_id": appt_oid, "call_status": current_state},
-        {"$set": update_set},
+    # First: atomically set the participant
+    await db.appointments.update_one(
+        {"_id": appt_oid},
+        {"$set": {
+            f"{role}_participant": participant_obj,
+            "updated_at": now
+        }}
     )
 
-    if result.modified_count == 0:
-        # State was changed concurrently — refetch and retry once
-        logger.info(
-            "handle_participant_joined: concurrent modification, retrying appointment_id=%s",
-            appointment_id,
+    # Second: fetch the updated document to derive truth
+    updated = await db.appointments.find_one({"_id": appt_oid})
+    if not updated:
+        return None
+
+    patient_p = updated.get("patient_participant")
+    doctor_p = updated.get("doctor_participant")
+
+    correct_state = "connected" if (patient_p and doctor_p) else "waiting" if (patient_p or doctor_p) else "idle"
+    count = int(bool(patient_p)) + int(bool(doctor_p))
+
+    state_update: dict[str, Any] = {}
+    
+    if updated.get("call_status") != correct_state:
+        state_update["call_status"] = correct_state
+        state_update["call_participant_count"] = count
+        
+        # Set call_connected_at on first connection
+        if correct_state == "connected" and not updated.get("call_connected_at"):
+            state_update["call_connected_at"] = now
+            
+        # Clear disconnect timeout if reconnecting
+        if current_state == "disconnected" and correct_state in ("waiting", "connected"):
+            state_update["call_disconnected_at"] = None
+            redis = get_redis()
+            await redis.delete(_disconnect_key(appointment_id))
+
+        await db.appointments.update_one(
+            {"_id": appt_oid},
+            {"$set": state_update}
         )
-        return await handle_participant_joined(appointment_id, identity, role, participant_sid)
 
     logger.info(
         "call_state_machine: %s → %s appointment_id=%s identity=%s participants=%d",
-        current_state, new_state, appointment_id, identity, count,
+        current_state, correct_state, appointment_id, identity, count,
     )
 
-    await _emit_state_change(appt, new_state, count, participants, now)
-    return {**appt, "call_status": new_state, "call_participants": participants}
+    # Construct array for SSE only
+    participants = []
+    if role == "patient":
+        participants.append(participant_obj)
+        if doctor_p: participants.append(doctor_p)
+    else:
+        if patient_p: participants.append(patient_p)
+        participants.append(participant_obj)
+
+    final_appt = {**updated, **state_update}
+    await _emit_state_change(final_appt, correct_state, count, participants, now)
+    return final_appt
 
 
 async def handle_participant_left(
@@ -270,69 +280,111 @@ async def handle_participant_left(
 
     current_state = appt.get("call_status", "idle")
     if current_state == "ended":
-        return None  # already ended, ignore
-
-    participants = list(appt.get("call_participants") or [])
-
-    # Remove this participant
-    participants = [p for p in participants if p.get("identity") != identity]
-    count = len(participants)
-
-    new_state = _derive_state_from_count(current_state, "participant_left", count)
-    if new_state is None:
         return None
 
-    if not _is_valid_transition(current_state, "participant_left", new_state):
-        logger.warning(
-            "handle_participant_left: invalid transition %s → %s for appointment_id=%s",
-            current_state, new_state, appointment_id,
-        )
+    patient_p = appt.get("patient_participant")
+    doctor_p = appt.get("doctor_participant")
+
+    # Detect role — validate identity AND SID together to reject stale webhooks.
+    # A stale participant_left (from an old connection replaced by reconnect)
+    # would match identity but carry the old SID. Without this check, it would
+    # clear the current active participant.
+    role = None
+    if patient_p and patient_p.get("identity") == identity:
+        if not patient_p or patient_p.get("sid") != participant_sid:
+            logger.info(
+                "Ignoring stale participant_left (patient SID mismatch)",
+                extra={
+                    "appointment_id": appointment_id,
+                    "identity": identity,
+                    "stored_sid": patient_p.get("sid") if patient_p else None,
+                    "incoming_sid": participant_sid,
+                },
+            )
+            return None
+        role = "patient"
+    elif doctor_p and doctor_p.get("identity") == identity:
+        if not doctor_p or doctor_p.get("sid") != participant_sid:
+            logger.info(
+                "Ignoring stale participant_left (doctor SID mismatch)",
+                extra={
+                    "appointment_id": appointment_id,
+                    "identity": identity,
+                    "stored_sid": doctor_p.get("sid") if doctor_p else None,
+                    "incoming_sid": participant_sid,
+                },
+            )
+            return None
+        role = "doctor"
+
+    if not role:
+        logger.warning("handle_participant_left: ignoring leave for unmatched identity=%s", identity)
         return None
 
-    # Idempotent: if already in this state with same participant list
-    if new_state == current_state:
-        await db.appointments.update_one(
-            {"_id": appt_oid},
-            {"$set": {"call_participants": participants, "call_participant_count": count, "updated_at": now}},
-        )
-        return None
-
-    update_set: dict[str, Any] = {
-        "call_status": new_state,
-        "call_participants": participants,
-        "call_participant_count": count,
-        "updated_at": now,
-    }
-
-    if new_state == "disconnected":
-        update_set["call_disconnected_at"] = now
-        # Start disconnect timeout in Redis
-        redis = get_redis()
-        await redis.setex(
-            _disconnect_key(appointment_id),
-            settings.CALL_DISCONNECT_TIMEOUT_SECONDS,
-            "1",
-        )
-
-    result = await db.appointments.update_one(
-        {"_id": appt_oid, "call_status": current_state},
-        {"$set": update_set},
+    # First: atomically remove the participant
+    await db.appointments.update_one(
+        {"_id": appt_oid},
+        {"$set": {
+            f"{role}_participant": None,
+            "updated_at": now
+        }}
     )
 
-    if result.modified_count == 0:
-        logger.info(
-            "handle_participant_left: concurrent modification, retrying appointment_id=%s",
-            appointment_id,
+    # Second: fetch the updated document to derive truth
+    updated = await db.appointments.find_one({"_id": appt_oid})
+    if not updated:
+        return None
+
+    patient_p = updated.get("patient_participant")
+    doctor_p = updated.get("doctor_participant")
+
+    count = int(bool(patient_p)) + int(bool(doctor_p))
+
+    if count == 0:
+        if current_state == "connected":
+            correct_state = "disconnected"
+        else:
+            correct_state = "idle"
+    elif count == 1:
+        if current_state == "connected":
+            correct_state = "disconnected"
+        else:
+            correct_state = "waiting"
+    else:
+        correct_state = "connected"
+
+    state_update: dict[str, Any] = {}
+    if updated.get("call_status") != correct_state:
+        state_update["call_status"] = correct_state
+        state_update["call_participant_count"] = count
+
+        if correct_state == "disconnected":
+            state_update["call_disconnected_at"] = now
+            # Start disconnect timeout in Redis
+            redis = get_redis()
+            await redis.setex(
+                _disconnect_key(appointment_id),
+                settings.CALL_DISCONNECT_TIMEOUT_SECONDS,
+                "1",
+            )
+
+        await db.appointments.update_one(
+            {"_id": appt_oid},
+            {"$set": state_update}
         )
-        return await handle_participant_left(appointment_id, identity, participant_sid)
 
     logger.info(
         "call_state_machine: %s → %s appointment_id=%s identity=%s participants=%d",
-        current_state, new_state, appointment_id, identity, count,
+        current_state, correct_state, appointment_id, identity, count,
     )
 
-    await _emit_state_change(appt, new_state, count, participants, now)
-    return {**appt, "call_status": new_state, "call_participants": participants}
+    participants = []
+    if patient_p: participants.append(patient_p)
+    if doctor_p: participants.append(doctor_p)
+
+    final_appt = {**updated, **state_update}
+    await _emit_state_change(final_appt, correct_state, count, participants, now)
+    return final_appt
 
 
 async def handle_room_finished(room_name: str) -> None:
@@ -353,7 +405,8 @@ async def handle_room_finished(room_name: str) -> None:
 
     update_set: dict[str, Any] = {
         "call_status": "ended",
-        "call_participants": [],
+        "patient_participant": None,
+        "doctor_participant": None,
         "call_participant_count": 0,
         "call_ended_at": now,
         "updated_at": now,
@@ -403,7 +456,8 @@ async def handle_manual_end(appointment_id: str, doctor_id: str) -> dict[str, An
 
     update_set: dict[str, Any] = {
         "call_status": "ended",
-        "call_participants": [],
+        "patient_participant": None,
+        "doctor_participant": None,
         "call_participant_count": 0,
         "call_ended_at": now,
         "updated_at": now,
@@ -454,7 +508,8 @@ async def handle_disconnect_timeout(appointment_id: str) -> None:
         {
             "$set": {
                 "call_status": "ended",
-                "call_participants": [],
+                "patient_participant": None,
+                "doctor_participant": None,
                 "call_participant_count": 0,
                 "call_ended_at": now,
                 "updated_at": now,
@@ -656,7 +711,7 @@ async def get_calls_dashboard(doctor_id: str, day: str) -> dict[str, Any]:
             "call_participant_count": a.get("call_participant_count", 0),
             "call_participants": [
                 {"role": p.get("role"), "identity": p.get("identity")}
-                for p in (a.get("call_participants") or [])
+                for p in [a.get("patient_participant"), a.get("doctor_participant")] if p
             ],
             "call_connected_at": (
                 a["call_connected_at"].isoformat() if a.get("call_connected_at") else None
