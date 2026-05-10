@@ -22,11 +22,13 @@ async def log_audit(
         ip = None
         user_agent = None
         if request:
-            forwarded = request.headers.get("X-Forwarded-For")
-            if forwarded:
-                ip = forwarded.split(",")[0].strip()
-            elif request.client:
-                ip = request.client.host
+            ip = request.headers.get("cf-connecting-ip")
+            if not ip:
+                forwarded = request.headers.get("X-Forwarded-For")
+                if forwarded:
+                    ip = forwarded.split(",")[0].strip()
+                elif request.client:
+                    ip = request.client.host
             user_agent = request.headers.get("User-Agent")
 
         await db.audit_logs.insert_one(

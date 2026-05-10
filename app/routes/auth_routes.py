@@ -126,9 +126,17 @@ def doctor_doc_to_out(doc: dict):
 
 
 def _client_ip(request: Request) -> str | None:
+    # 1. Prioritize Cloudflare's real client IP
+    cf_ip = request.headers.get("cf-connecting-ip")
+    if cf_ip:
+        return cf_ip.strip()
+
+    # 2. Fallback to standard forwarded-for
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
         return forwarded.split(",")[0].strip()
+
+    # 3. Last resort: direct socket host
     return request.client.host if request.client else None
 
 
@@ -191,10 +199,12 @@ async def _issue_doctor_tokens(
 
 
 def _pending_context_ok(pending: dict, request: Request) -> bool:
-    return (
-        str(pending.get("ip") or "") == str(_client_ip(request) or "")
-        and str(pending.get("user_agent") or "") == _user_agent(request)
-    )
+    """
+    Check if the client context matches the pending login state.
+    We prioritize User-Agent over IP because IP is unreliable behind proxies (e.g. Cloudflare).
+    The short-lived temp_token itself provides the primary security guarantee.
+    """
+    return str(pending.get("user_agent") or "") == _user_agent(request)
 
 
 async def _decode_access_token(token: str) -> dict:
