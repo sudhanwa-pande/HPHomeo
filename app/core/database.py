@@ -117,9 +117,21 @@ async def connect_db():
         [("is_follow_up_eligible", 1), ("follow_up_eligible_until", 1)],
         sparse=True,
     )
-    await _db.appointments.create_index(
-        [("call_status", 1), ("updated_at", 1)]
-    )
+    try:
+        await _db.appointments.create_index(
+            [("call_status", 1), ("updated_at", 1)],
+            name="idx_call_lifecycle"
+        )
+    except OperationFailure as e:
+        if e.code == 86:
+            # Drop the auto-generated conflicting index once
+            await _db.appointments.drop_index("call_status_1_updated_at_1")
+            await _db.appointments.create_index(
+                [("call_status", 1), ("updated_at", 1)],
+                name="idx_call_lifecycle"
+            )
+        else:
+            raise
     await _db.appointments.create_index(
         [("refund_status", 1), ("payment_id", 1)],
         sparse=True,
