@@ -80,10 +80,11 @@ async def ensure_video_room(db, appointment: dict) -> str:
             from livekit import api
             import logging
             logger = logging.getLogger(__name__)
-            room_client = api.RoomService(settings.LIVEKIT_URL, settings.LIVEKIT_API_KEY, settings.LIVEKIT_API_SECRET.get_secret_value())
-            req = api.CreateRoomRequest(name=room_name, empty_timeout=5*60, max_participants=2)
-            await room_client.create_room(req)
-            await room_client.aclose()
+            
+            async with api.LiveKitAPI(settings.LIVEKIT_URL, settings.LIVEKIT_API_KEY, settings.LIVEKIT_API_SECRET.get_secret_value()) as lkapi:
+                req = api.CreateRoomRequest(name=room_name, empty_timeout=5*60, max_participants=2)
+                await lkapi.room.create_room(req)
+                
             logger.info("livekit_room_created", extra={"room": room_name, "max_participants": 2})
         except Exception as e:
             import logging
