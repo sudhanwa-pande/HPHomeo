@@ -6,8 +6,12 @@ from bson import ObjectId
 
 from app.core.config import settings
 from app.services.cache_service import invalidate_doctor_cache, invalidate_patient_cache
-from app.services.email_service import safe_send_email, send_reminder_email
+from app.services.email_service import safe_send_email, send_reminder_email, send_payment_confirmation, send_doctor_new_booking
 from app.services.whatsapp_service import safe_send_whatsapp, send_patient_appointment_update_whatsapp
+from app.services.video_service import ensure_video_room
+from app.routes.receipt_routes import generate_receipt_for_appointment
+from app.services.cloudinary_service import cloudinary_service
+from app.services.event_bus import notify_doctor, EVENT_PAYMENT_CONFIRMED, EVENT_APPOINTMENT_BOOKED
 from app.services.razorpay_service import fetch_order, fetch_order_payments, fetch_refund, initiate_refund
 from app.utils.time import utc_now
 from app.worker.base_task import BaseTaskWithDLQ
@@ -759,6 +763,79 @@ async def reconcile_captured_payments():
                 appt_id, payment_id,
             )
             confirmed += 1
+            
+            # ── Trigger Emails & Notifications (Fallback) ──
+            try:
+                from datetime import timezone
+                updated_appt = await db.appointments.find_one({"_id": appt_id})
+                if updated_appt:
+                    if updated_appt.get("mode") == "online" and updated_appt.get("video_enabled", True):
+                        try:
+                            await ensure_video_room(db, updated_appt)
+                            updated_appt = await db.appointments.find_one({"_id": appt_id})
+                        except Exception:
+                            logger.warning("reconcile_captured_payments: ensure_video_room failed", exc_info=True)
+
+                    receipt_pdf_bytes = None
+                    receipt_pdf_url = None
+                    receipt_id = None
+                    try:
+                        receipt, receipt_pdf_bytes = await generate_receipt_for_appointment(
+                            db, updated_appt, payment_id=payment_id,
+                        )
+                        raw_receipt_pdf_url = receipt.get("pdf_url")
+                        if raw_receipt_pdf_url:
+                            receipt_pdf_url = cloudinary_service.pdf_view_url(url=raw_receipt_pdf_url)
+                        receipt_id = receipt.get("receipt_id")
+                    except Exception:
+                        logger.warning("reconcile_captured_payments: generate_receipt failed", exc_info=True)
+
+                    if updated_appt.get("patient_email"):
+                        await safe_send_email(
+                            send_payment_confirmation(
+                                updated_appt,
+                                receipt_pdf_bytes=receipt_pdf_bytes,
+                                receipt_id=receipt_id,
+                            ),
+                            "payment confirmation",
+                        )
+
+                    await safe_send_whatsapp(
+                        send_patient_appointment_update_whatsapp(
+                            updated_appt,
+                            "payment_confirmed",
+                            receipt_pdf_url=receipt_pdf_url,
+                            receipt_id=receipt_id,
+                        ),
+                        "payment confirmation",
+                    )
+
+                    if updated_appt.get("doctor_email"):
+                        await safe_send_email(
+                            send_doctor_new_booking(updated_appt, updated_appt["doctor_email"]),
+                            "doctor new booking",
+                        )
+
+                    scheduled_at = updated_appt.get("scheduled_at")
+                    if scheduled_at:
+                        if scheduled_at.tzinfo is None:
+                            scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
+                        await invalidate_doctor_cache(str(updated_appt.get("doctor_id")), day=scheduled_at.date().isoformat())
+                    
+                    if updated_appt.get("patient_user_id"):
+                        await invalidate_patient_cache(str(updated_appt["patient_user_id"]))
+
+                    doctor_id = str(updated_appt.get("doctor_id"))
+                    event_data = {
+                        "appointment_id": str(appt_id),
+                        "patient_name": updated_appt.get("patient_name"),
+                        "scheduled_at": scheduled_at.isoformat() if scheduled_at else None,
+                        "mode": updated_appt.get("mode"),
+                    }
+                    await notify_doctor(doctor_id, EVENT_PAYMENT_CONFIRMED, event_data)
+                    await notify_doctor(doctor_id, EVENT_APPOINTMENT_BOOKED, event_data)
+            except Exception:
+                logger.exception("reconcile_captured_payments: failed to send fallback notifications")
         else:
             # Race lost: expire_pending_payments cancelled this appointment
             # between our read and write. Razorpay shows it as paid, but the

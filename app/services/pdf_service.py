@@ -264,7 +264,7 @@ def build_prescription_pdf_bytes(
     separator_y = row_two_y - 5 * mm
     pdf.setLineWidth(0.6)
     pdf.line(left, separator_y, right, separator_y)
-    y = separator_y - section_gap
+    y = separator_y - 15 * mm
 
     def draw_section(title: str, body: str, current_y: float, *, min_height: float = 20 * mm) -> float:
         current_y = ensure_space(current_y, min_height)
@@ -371,18 +371,22 @@ def build_prescription_pdf_bytes(
             height=signature_height,
             mask="auto",
             preserveAspectRatio=True,
-            anchor="sw",
+            anchor="s",
         )
 
     text_y = signature_y - 2 * mm
     pdf.setFont("Helvetica", 8.5)
-    pdf.drawRightString(right, text_y, doctor_name)
+    
+    # Calculate center of the signature block for text alignment
+    block_center = signature_x + (signature_width / 2)
+    
+    pdf.drawCentredString(block_center, text_y, doctor_name)
     if qualifications:
         text_y -= 4 * mm
-        pdf.drawRightString(right, text_y, qualifications)
+        pdf.drawCentredString(block_center, text_y, qualifications)
     if registration_no:
         text_y -= 4 * mm
-        pdf.drawRightString(right, text_y, f"Reg no. {registration_no}")
+        pdf.drawCentredString(block_center, text_y, f"Reg no. {registration_no}")
 
     pdf.save()
     return buf.getvalue()
