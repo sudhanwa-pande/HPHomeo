@@ -1,9 +1,8 @@
 # hpHomeo — Scalable Clinic Backend
 
-<<<<<<< HEAD
 **🔗 [View the Frontend Next.js Repository Here](https://github.com/sudhanwa-pande/HPHomeo-webapp)**
 
-## 🚀 Overview
+## Overview
 =======
 ## Overview
 >>>>>>> 5d05c97bf9d9831c63cf3481d3fb3ada60bcaf08
