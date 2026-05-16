@@ -1,5 +1,7 @@
 # hpHomeo — Scalable Clinic Backend
 
+**🔗 [View the Frontend Next.js Repository Here](https://github.com/sudhanwa-pande/HPHomeo-webapp)**
+
 ## 🚀 Overview
 
 A production-grade, highly concurrent FastAPI backend engineered specifically for homeopathic doctors—bridging the gap in the market for a dedicated, specialized telemedicine platform. Built to handle complex scheduling rules, race-condition-proof booking, LiveKit WebRTC video consultations, and resilient payment processing. Features an event-driven architecture utilizing Celery and Redis to decouple background operations from the synchronous critical path.
