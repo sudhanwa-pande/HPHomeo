@@ -1,14 +1,18 @@
 # hpHomeo — Scalable Clinic Backend
 
+<<<<<<< HEAD
 **🔗 [View the Frontend Next.js Repository Here](https://github.com/sudhanwa-pande/HPHomeo-webapp)**
 
 ## 🚀 Overview
+=======
+## Overview
+>>>>>>> 5d05c97bf9d9831c63cf3481d3fb3ada60bcaf08
 
 A production-grade, highly concurrent FastAPI backend engineered specifically for homeopathic doctors—bridging the gap in the market for a dedicated, specialized telemedicine platform. Built to handle complex scheduling rules, race-condition-proof booking, LiveKit WebRTC video consultations, and resilient payment processing. Features an event-driven architecture utilizing Celery and Redis to decouple background operations from the synchronous critical path.
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 <p align="center">
   <img src="app/Architecture_diagram/hpHomeo%20%E2%80%94%20Architecture%20v5%20(Hierarchy).png" alt="Architecture Diagram" width="850">
@@ -18,7 +22,7 @@ A production-grade, highly concurrent FastAPI backend engineered specifically fo
 
 ---
 
-## 🔄 Booking Flow
+## Booking Flow
 
 <p align="center">
   <img src="app/Architecture_diagram/hpHomeo%20%E2%80%94%201.%20Booking%20Flow%20(v2).png" alt="Booking Sequence Diagram" width="850">
@@ -28,7 +32,7 @@ A production-grade, highly concurrent FastAPI backend engineered specifically fo
 
 ---
 
-## 💳 Payment Lifecycle
+## Payment Lifecycle
 
 <p align="center">
   <img src="app/Architecture_diagram/hpHomeo%20%E2%80%94%202.%20Payment%20Webhook%20Flow%20(v2).png" alt="Payment Webhook Flow" width="850">
@@ -38,7 +42,7 @@ A production-grade, highly concurrent FastAPI backend engineered specifically fo
 
 ---
 
-## ⚙️ Tech Stack
+## Tech Stack
 
 *   **Backend:** FastAPI, Python
 *   **Database:** MongoDB (Motor)
@@ -49,7 +53,7 @@ A production-grade, highly concurrent FastAPI backend engineered specifically fo
 
 ---
 
-## 🧠 Design Principles
+## Design Principles
 
 *   **Idempotency (Webhooks):** All webhook handlers enforce state-based conditional updates to safely absorb duplicate or retried external events without data corruption.
 *   **Async-First Architecture:** Native asynchronous IO maximizes throughput for concurrent operations like schedule rendering and LiveKit video room provisioning.
@@ -59,7 +63,7 @@ A production-grade, highly concurrent FastAPI backend engineered specifically fo
 
 ---
 
-## 🚀 Getting Started
+## Getting Started
 
 ```bash
 # Clone repository
@@ -79,9 +83,9 @@ fastapi dev app/main.py
 
 ---
 
-## ⚠️ Limitations & Future Roadmap
+## Limitations & Future Roadmap
 
 *   **Current Constraint (NoSQL):** The system currently relies on MongoDB. While highly scalable and fast for denormalized reads, NoSQL lacks strict relational integrity and makes complex financial/transactional auditing more challenging.
 *   **Future Improvement (PostgreSQL):** We are planning a full migration to **PostgreSQL**. This will bring robust ACID transactions, strict relational data modeling, Alembic-based schema migrations, and improved data consistency guarantees for our core billing schemas.
-*   **Observability Gap:** Currently, the system relies on standard logging. We plan to implement distributed tracing (e.g., **OpenTelemetry**) to trace requests across asynchronous boundaries (FastAPI -> Redis -> Celery) for better debugging.
+*   **Observability Gap:** Currently, the system relies on standard logging, we are using sentry for error tracking. We plan to implement distributed tracing (e.g. **OpenTelemetry**) to trace requests across asynchronous boundaries (FastAPI -> Redis -> Celery) for better debugging.
 *   **Worker Graceful Shutdowns:** Long-running Celery tasks require more robust graceful shutdown handling during CI/CD deployments to ensure zero dropped jobs.
