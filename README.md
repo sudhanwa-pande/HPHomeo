@@ -81,5 +81,5 @@ fastapi dev app/main.py
 
 *   **Current Constraint (NoSQL):** The system currently relies on MongoDB. While highly scalable and fast for denormalized reads, NoSQL lacks strict relational integrity and makes complex financial/transactional auditing more challenging.
 *   **Future Improvement (PostgreSQL):** We are planning a full migration to **PostgreSQL**. This will bring robust ACID transactions, strict relational data modeling, Alembic-based schema migrations, and improved data consistency guarantees for our core billing schemas.
-*   **Observability Gap:** Currently, the system relies on standard logging. We plan to implement distributed tracing (e.g., **OpenTelemetry**) to trace requests across asynchronous boundaries (FastAPI -> Redis -> Celery) for better debugging.
+*   **Observability Gap:** Currently, the system relies on standard logging, we are using sentry for error tracking. We plan to implement distributed tracing (e.g. **OpenTelemetry**) to trace requests across asynchronous boundaries (FastAPI -> Redis -> Celery) for better debugging.
 *   **Worker Graceful Shutdowns:** Long-running Celery tasks require more robust graceful shutdown handling during CI/CD deployments to ensure zero dropped jobs.
