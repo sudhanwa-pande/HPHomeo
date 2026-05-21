@@ -28,6 +28,7 @@ class DoctorRegister(BaseModel):
     phone: str = Field(min_length=7, max_length=20)
     password: str = Field(min_length=8, max_length=128)
     registration_no: str = Field(min_length=3, max_length=50)
+    turnstileToken: str | None = None
 
     @field_validator("password")
     @classmethod

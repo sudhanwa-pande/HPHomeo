@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     AUTH_REDIS_ENABLED: bool = True
     AUTH_2STEP_ENABLED: bool = True
     BLACKLIST_BACKEND: Literal["mongo", "redis", "dual"] = "redis"
+    TURNSTILE_SECRET_KEY: str | None = None
 
     # Rate limits
     RL_ADMIN_READ_TIMES: int = 60

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import pyotp
 import qrcode
+import httpx
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from jose import JWTError
@@ -306,6 +307,26 @@ async def get_current_admin(request: Request):
 async def register(data: DoctorRegister):
     db = get_db()
     now = utc_now()
+
+    turnstile_secret = getattr(settings, "TURNSTILE_SECRET_KEY", None)
+    if turnstile_secret:
+        if not data.turnstileToken:
+            raise HTTPException(status_code=403, detail="CAPTCHA token missing")
+        async with httpx.AsyncClient() as client:
+            try:
+                resp = await client.post(
+                    "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+                    data={"secret": turnstile_secret, "response": data.turnstileToken},
+                    timeout=5.0
+                )
+                outcome = resp.json()
+                if not outcome.get("success"):
+                    logger.warning(f"Turnstile verification failed: {outcome}")
+                    raise HTTPException(status_code=403, detail="CAPTCHA verification failed")
+            except httpx.RequestError as e:
+                logger.error(f"Error contacting Cloudflare: {e}")
+                raise HTTPException(status_code=500, detail="CAPTCHA service unavailable")
+
     try:
         email = data.email.strip().lower()
         try:
