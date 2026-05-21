@@ -90,13 +90,13 @@ def set_auth_cookies(
         "path": "/",
     }
     response.set_cookie(
-        key="access_token",
+        key=f"{role}_access_token",
         value=access_token,
         max_age=access_max_age,
         **cookie_kwargs,
     )
     response.set_cookie(
-        key="refresh_token",
+        key=f"{role}_refresh_token",
         value=refresh_token,
         max_age=refresh_max_age,
         **cookie_kwargs,
@@ -105,8 +105,8 @@ def set_auth_cookies(
 
 def clear_auth_cookies(response: Response, *, role: str) -> None:
     """Delete httpOnly auth cookies for a given role."""
-    response.delete_cookie("access_token", path="/")
-    response.delete_cookie("refresh_token", path="/")
+    response.delete_cookie(f"{role}_access_token", path="/")
+    response.delete_cookie(f"{role}_refresh_token", path="/")
 
 
 def set_public_patient_access_cookie(

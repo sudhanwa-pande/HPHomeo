@@ -2,6 +2,7 @@ import re
 from datetime import datetime
 from typing import Literal
 
+from email_validator import validate_email, EmailNotValidError
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
 from app.utils.phone import normalize_phone_e164
@@ -51,6 +52,28 @@ class DoctorRegister(BaseModel):
     @classmethod
     def validate_phone(cls, value: str) -> str:
         return normalize_phone_e164(value)
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def validate_email_strict(cls, value: str) -> str:
+        if not isinstance(value, str):
+            return value
+        try:
+            # check_deliverability=True forces a DNS MX record lookup
+            valid = validate_email(value, check_deliverability=True)
+            domain = valid.domain.lower()
+            
+            # Common disposable domains blocklist
+            disposable = {
+                "mailinator.com", "10minutemail.com", "temp-mail.org", 
+                "yopmail.com", "guerrillamail.com", "tempmail.com", "throwawaymail.com"
+            }
+            if domain in disposable:
+                raise ValueError("Disposable email addresses are not allowed")
+                
+            return valid.normalized
+        except EmailNotValidError as e:
+            raise ValueError(f"Invalid email: {str(e)}")
 
 
 class DoctorLogin(BaseModel):
