@@ -31,6 +31,8 @@ def create_access_token(data: dict, expires_minutes: int | None = None) -> str:
         "iat": now,
         "exp": expire,
         "jti": to_encode.get("jti") or str(uuid.uuid4()),
+        "iss": "hphomeo-backend",
+        "aud": "hphomeo-frontend",
     })
     return jwt.encode(to_encode, settings.JWT_SECRET.get_secret_value(), algorithm=settings.JWT_ALGO)
 
@@ -44,6 +46,8 @@ def create_refresh_token(data: dict, expires_days: int | None = None) -> str:
             "exp": expire,
             "jti": to_encode.get("jti") or str(uuid.uuid4()),
             "type": "refresh",
+            "iss": "hphomeo-backend",
+            "aud": "hphomeo-frontend",
         }
     )
     return jwt.encode(to_encode, settings.JWT_SECRET.get_secret_value(), algorithm=settings.JWT_ALGO)
@@ -53,7 +57,9 @@ def decode_token(token: str) -> dict:
         token,
         settings.JWT_SECRET.get_secret_value(),
         algorithms=[settings.JWT_ALGO],
-        options={"verify_exp": True, "verify_signature": True},
+        audience="hphomeo-frontend",
+        issuer="hphomeo-backend",
+        options={"verify_exp": True, "verify_signature": True, "verify_aud": True, "verify_iss": True},
     )
 
 
