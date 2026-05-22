@@ -82,7 +82,7 @@ async def ensure_video_room(db, appointment: dict) -> str:
             logger = logging.getLogger(__name__)
             
             async with api.LiveKitAPI(settings.LIVEKIT_URL, settings.LIVEKIT_API_KEY, settings.LIVEKIT_API_SECRET.get_secret_value()) as lkapi:
-                req = api.CreateRoomRequest(name=room_name, empty_timeout=5*60, max_participants=2)
+                req = api.CreateRoomRequest(name=room_name, empty_timeout=30*60, max_participants=2)
                 await lkapi.room.create_room(req)
                 
             logger.info("livekit_room_created", extra={"room": room_name, "max_participants": 2})

@@ -214,9 +214,20 @@ async def handle_participant_joined(
 
     patient_p = updated.get("patient_participant")
     doctor_p = updated.get("doctor_participant")
-
-    correct_state = "connected" if (patient_p and doctor_p) else "waiting" if (patient_p or doctor_p) else "idle"
+    
+    room_name = updated.get("video_room")
     count = int(bool(patient_p)) + int(bool(doctor_p))
+    
+    if room_name:
+        from livekit import api
+        try:
+            async with api.LiveKitAPI(settings.LIVEKIT_URL, settings.LIVEKIT_API_KEY, settings.LIVEKIT_API_SECRET.get_secret_value()) as lkapi:
+                participants_res = await lkapi.room.list_participants(api.ListParticipantsRequest(room=room_name))
+                count = len(participants_res.participants)
+        except Exception as e:
+            logger.warning("handle_participant_joined: list_participants failed, falling back to DB count. error=%s", str(e))
+
+    correct_state = "connected" if count >= 2 else "waiting" if count == 1 else "idle"
 
     state_update: dict[str, Any] = {}
     
@@ -338,7 +349,20 @@ async def handle_participant_left(
     patient_p = updated.get("patient_participant")
     doctor_p = updated.get("doctor_participant")
 
+    room_name = updated.get("video_room")
     count = int(bool(patient_p)) + int(bool(doctor_p))
+    
+    if room_name:
+        from livekit import api
+        try:
+            async with api.LiveKitAPI(settings.LIVEKIT_URL, settings.LIVEKIT_API_KEY, settings.LIVEKIT_API_SECRET.get_secret_value()) as lkapi:
+                participants_res = await lkapi.room.list_participants(api.ListParticipantsRequest(room=room_name))
+                count = len(participants_res.participants)
+        except Exception as e:
+            if "not found" in str(e).lower():
+                count = 0  # Room was deleted by LiveKit because it's empty
+            else:
+                logger.warning("handle_participant_left: list_participants failed, falling back to DB count. error=%s", str(e))
 
     if count == 0:
         if current_state == "connected":
@@ -472,6 +496,16 @@ async def handle_manual_end(appointment_id: str, doctor_id: str) -> dict[str, An
     redis = get_redis()
     await redis.delete(_disconnect_key(appointment_id))
     await _clear_heartbeat(redis, appointment_id, str(appt.get("doctor_id")))
+    
+    # Physically destroy the room on the LiveKit server to kick out ghost patients
+    room_name = appt.get("video_room")
+    if room_name:
+        from livekit import api
+        try:
+            async with api.LiveKitAPI(settings.LIVEKIT_URL, settings.LIVEKIT_API_KEY, settings.LIVEKIT_API_SECRET.get_secret_value()) as lkapi:
+                await lkapi.room.delete_room(api.DeleteRoomRequest(room=room_name))
+        except Exception as e:
+            logger.warning("handle_manual_end: failed to delete LiveKit room %s: %s", room_name, str(e))
 
     logger.info(
         "call_state_machine: %s → ended (manual) appointment_id=%s",

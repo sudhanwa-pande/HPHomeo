@@ -18,7 +18,7 @@ import hashlib
 import json
 import logging
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, BackgroundTasks
 
 from jose import jwt, JWTError
 
@@ -121,8 +121,8 @@ def _extract_appointment_id_from_metadata(metadata_str: str | None) -> str | Non
 
 
 @router.post("/livekit")
-async def livekit_webhook(request: Request):
-    """Handle LiveKit server webhooks for participant/room events."""
+async def livekit_webhook(request: Request, background_tasks: BackgroundTasks):
+    """Handle LiveKit server webhooks for participant/room events using BackgroundTasks."""
     body = await request.body()
     auth_header = request.headers.get("Authorization")
 
@@ -170,7 +170,7 @@ async def livekit_webhook(request: Request):
 
         role = _extract_role_from_identity(identity)
         logger.info("participant_joined webhook: appointment_id=%s role=%s trace_id=%s", appointment_id, role, trace_id)
-        await handle_participant_joined(appointment_id, identity, role, participant_sid)
+        background_tasks.add_task(handle_participant_joined, appointment_id, identity, role, participant_sid)
         return {"status": "ok"}
 
     elif event == "participant_left":
@@ -180,7 +180,7 @@ async def livekit_webhook(request: Request):
 
         role = _extract_role_from_identity(identity)
         logger.info("participant_left webhook: appointment_id=%s role=%s trace_id=%s", appointment_id, role, trace_id)
-        await handle_participant_left(appointment_id, identity, participant_sid)
+        background_tasks.add_task(handle_participant_left, appointment_id, identity, participant_sid)
         return {"status": "ok"}
 
     elif event == "room_finished":
@@ -188,9 +188,10 @@ async def livekit_webhook(request: Request):
             return {"status": "ignored"}
 
         logger.info("room_finished webhook: room=%s appointment_id=%s trace_id=%s", room_name, appointment_id, trace_id)
-        await handle_room_finished(room_name)
+        background_tasks.add_task(handle_room_finished, room_name)
         return {"status": "ok"}
 
     else:
         logger.debug("LiveKit webhook: unhandled event=%s", event)
         return {"status": "ignored", "event": event}
+
