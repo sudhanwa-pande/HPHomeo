@@ -304,21 +304,11 @@ async def public_video_token(
     logger.info("video_token_issued", extra={"appointment_id": appointment_id, "role": "patient", "identity": identity, "trace_id": trace_id, "public": True})
 
     try:
-        scheduled_at = ensure_utc(appt.get("scheduled_at"))
-        duration_min = int(appt.get("duration_min", 20))
-        grace_period_min = 5
-        
-        # Calculate exactly when the session should hard-stop
-        hard_stop_time = scheduled_at + timedelta(minutes=duration_min + grace_period_min)
-        ttl_seconds = int((hard_stop_time - now).total_seconds())
-        if ttl_seconds < 60:
-            ttl_seconds = 60
-
         join_token = create_video_token(
             room=room,
             identity=identity,
             metadata={"appointment_id": appointment_id, "role": "patient", "trace_id": trace_id},
-            ttl_seconds=ttl_seconds,
+            ttl_seconds=7200,
         )
     except Exception as e:
         logger.error("livekit_token_generation_failed", extra={"appointment_id": appointment_id, "role": "patient", "public": True, "error": str(e), "trace_id": trace_id})

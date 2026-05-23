@@ -1,22 +1,28 @@
 import asyncio
 from datetime import timedelta
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException
 from bson import ObjectId
 
 from app.core.config import settings
 from app.core.database import get_db
+from app.core.redis import get_redis
 from app.routes.auth_routes import get_current_doctor
 from app.services.cache_service import invalidate_doctor_cache, invalidate_patient_cache
 from app.services.email_service import safe_send_email, send_prescription_email
 from app.services.event_bus import (
     notify_appointment,
+    notify_doctor,
     notify_patient,
     EVENT_APPOINTMENT_COMPLETED,
     EVENT_APPOINTMENT_NO_SHOW,
+    EVENT_CALL_STATE_CHANGED,
 )
 from app.services.whatsapp_service import safe_send_whatsapp, send_patient_prescription_whatsapp
 from app.utils.time import utc_now, ensure_utc
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/doctor/appointments", tags=["Doctor Appointment Actions"])
 
@@ -54,12 +60,6 @@ async def complete_appointment(appointment_id: str, doctor=Depends(get_current_d
     now = utc_now()
     scheduled_at = ensure_utc(appt.get("scheduled_at"))
 
-    if scheduled_at and now < scheduled_at:
-        raise HTTPException(
-            status_code=409,
-            detail="Cannot complete appointment before scheduled time",
-        )
-
     follow_up_days = int(getattr(settings, "FOLLOW_UP_DAYS", 7))
     follow_up_until = now + timedelta(days=follow_up_days)
 
@@ -67,6 +67,11 @@ async def complete_appointment(appointment_id: str, doctor=Depends(get_current_d
         "status": "completed",
         "completed_at": now,
         "updated_at": now,
+        "call_status": "ended",
+        "patient_participant": None,
+        "doctor_participant": None,
+        "call_participant_count": 0,
+        "call_ended_at": now,
     }
 
     # Only "new" appointments can grant follow-up eligibility
@@ -90,15 +95,54 @@ async def complete_appointment(appointment_id: str, doctor=Depends(get_current_d
     if appt.get("patient_id"):
         await invalidate_patient_cache(str(appt["patient_id"]))
 
+    # ─── Call Cleanup ───
+    try:
+        redis = get_redis()
+        await redis.delete(f"call:disconnected:{appointment_id}")
+        await redis.delete(f"call:heartbeat:{appointment_id}")
+        await redis.srem(f"call:heartbeat:doctor:{str(doctor['_id'])}", appointment_id)
+    except Exception as e:
+        logger.warning("complete_appointment: failed to clear Redis keys: %s", str(e))
+
+    room_name = appt.get("video_room")
+    if room_name and settings.VIDEO_ENABLED:
+        try:
+            from livekit import api
+            async with api.LiveKitAPI(
+                settings.LIVEKIT_URL,
+                settings.LIVEKIT_API_KEY,
+                settings.LIVEKIT_API_SECRET.get_secret_value()
+            ) as lkapi:
+                await lkapi.room.delete_room(api.DeleteRoomRequest(room=room_name))
+        except Exception as e:
+            logger.warning("complete_appointment: failed to delete LiveKit room %s: %s", room_name, str(e))
+
     # SSE: notify patient and appointment channel that appointment is completed
     event_data = {
         "appointment_id": appointment_id,
         "status": "completed",
         "completed_at": now.isoformat(),
+        "call_status": "ended",
     }
     await notify_appointment(appointment_id, EVENT_APPOINTMENT_COMPLETED, event_data)
     if appt.get("patient_user_id"):
         await notify_patient(str(appt["patient_user_id"]), EVENT_APPOINTMENT_COMPLETED, event_data)
+
+    # Also notify call state changed to ended
+    call_event_data = {
+        "appointment_id": appointment_id,
+        "call_status": "ended",
+        "call_participant_count": 0,
+        "call_participants": [],
+        "patient_name": appt.get("patient_name"),
+        "scheduled_at": (
+            appt["scheduled_at"].isoformat() if appt.get("scheduled_at") else None
+        ),
+    }
+    await notify_doctor(str(doctor["_id"]), EVENT_CALL_STATE_CHANGED, call_event_data)
+    await notify_appointment(appointment_id, EVENT_CALL_STATE_CHANGED, call_event_data)
+    if appt.get("patient_user_id"):
+        await notify_patient(str(appt["patient_user_id"]), EVENT_CALL_STATE_CHANGED, call_event_data)
 
     # ── Fire prescription notifications (WhatsApp + email) in the background ──
     pdf_url = prescription.get("pdf_url") if prescription else None
@@ -180,6 +224,11 @@ async def mark_no_show(
                 "updated_at": now,
                 "is_follow_up_eligible": False,
                 "follow_up_eligible_until": None,
+                "call_status": "ended",
+                "patient_participant": None,
+                "doctor_participant": None,
+                "call_participant_count": 0,
+                "call_ended_at": now,
             }
         },
     )
@@ -192,15 +241,54 @@ async def mark_no_show(
     if appt.get("patient_id"):
         await invalidate_patient_cache(str(appt["patient_id"]))
 
+    # ─── Call Cleanup ───
+    try:
+        redis = get_redis()
+        await redis.delete(f"call:disconnected:{appointment_id}")
+        await redis.delete(f"call:heartbeat:{appointment_id}")
+        await redis.srem(f"call:heartbeat:doctor:{str(doctor['_id'])}", appointment_id)
+    except Exception as e:
+        logger.warning("mark_no_show: failed to clear Redis keys: %s", str(e))
+
+    room_name = appt.get("video_room")
+    if room_name and settings.VIDEO_ENABLED:
+        try:
+            from livekit import api
+            async with api.LiveKitAPI(
+                settings.LIVEKIT_URL,
+                settings.LIVEKIT_API_KEY,
+                settings.LIVEKIT_API_SECRET.get_secret_value()
+            ) as lkapi:
+                await lkapi.room.delete_room(api.DeleteRoomRequest(room=room_name))
+        except Exception as e:
+            logger.warning("mark_no_show: failed to delete LiveKit room %s: %s", room_name, str(e))
+
     # SSE: notify patient and appointment channel of no-show marking
     event_data = {
         "appointment_id": appointment_id,
         "status": "no_show",
         "no_show_at": now.isoformat(),
+        "call_status": "ended",
     }
     await notify_appointment(appointment_id, EVENT_APPOINTMENT_NO_SHOW, event_data)
     if appt.get("patient_user_id"):
         await notify_patient(str(appt["patient_user_id"]), EVENT_APPOINTMENT_NO_SHOW, event_data)
+
+    # Also notify call state changed to ended
+    call_event_data = {
+        "appointment_id": appointment_id,
+        "call_status": "ended",
+        "call_participant_count": 0,
+        "call_participants": [],
+        "patient_name": appt.get("patient_name"),
+        "scheduled_at": (
+            appt["scheduled_at"].isoformat() if appt.get("scheduled_at") else None
+        ),
+    }
+    await notify_doctor(str(doctor["_id"]), EVENT_CALL_STATE_CHANGED, call_event_data)
+    await notify_appointment(appointment_id, EVENT_CALL_STATE_CHANGED, call_event_data)
+    if appt.get("patient_user_id"):
+        await notify_patient(str(appt["patient_user_id"]), EVENT_CALL_STATE_CHANGED, call_event_data)
 
     return {
         "message": "marked_no_show",

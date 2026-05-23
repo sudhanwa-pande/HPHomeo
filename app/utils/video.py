@@ -11,7 +11,7 @@ def check_join_window(appointment: dict, now: datetime, role: str = "patient") -
     
     # Define role-based early limits
     if role == "doctor":
-        early_limit = 5  # Doctor can join 5 mins early
+        early_limit = 15  # Doctor can join 15 mins early (host gets extra setup time)
     else:
         early_limit = int(settings.VIDEO_JOIN_EARLY_MINUTES) if hasattr(settings, 'VIDEO_JOIN_EARLY_MINUTES') else 10
         

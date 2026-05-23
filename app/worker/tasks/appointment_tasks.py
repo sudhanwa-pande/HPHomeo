@@ -326,20 +326,65 @@ async def auto_no_show():
     db = await get_task_db()
     now = utc_now()
     cutoff = now - timedelta(minutes=30)
-    result = await db.appointments.update_many(
+    
+    cursor = db.appointments.find(
         {
             "status": "confirmed",
             "scheduled_at": {"$lte": cutoff},
-        },
-        {
-            "$set": {
-                "status": "no_show",
-                "no_show_at": now,
-                "updated_at": now,
-            }
-        },
+            "call_connected_at": None,
+        }
     )
-    logger.info("auto_no_show: marked=%d", result.modified_count)
+    docs = await cursor.to_list(length=None)
+    if not docs:
+        return
+
+    from app.services.sse_service import notify_appointment, notify_patient
+    from app.core.config import settings
+
+    count = 0
+    for doc in docs:
+        res = await db.appointments.update_one(
+            {"_id": doc["_id"], "status": "confirmed"},
+            {
+                "$set": {
+                    "status": "no_show",
+                    "call_status": "ended",
+                    "no_show_at": now,
+                    "updated_at": now,
+                }
+            },
+        )
+        if res.modified_count > 0:
+            count += 1
+            appt_id_str = str(doc["_id"])
+            event_data = {
+                "appointment_id": appt_id_str,
+                "status": "no_show",
+                "call_status": "ended",
+                "no_show_at": now.isoformat(),
+            }
+            # Force immediate SSE updates to waiting participants
+            await notify_appointment(appt_id_str, "appointment_no_show", event_data)
+            await notify_appointment(appt_id_str, "call_state_changed", event_data)
+            
+            if doc.get("patient_user_id"):
+                await notify_patient(str(doc["patient_user_id"]), "appointment_no_show", event_data)
+
+            # Forcefully terminate the WebRTC connection
+            room_name = doc.get("video_room")
+            if room_name and settings.VIDEO_ENABLED:
+                try:
+                    from livekit import api
+                    async with api.LiveKitAPI(
+                        settings.LIVEKIT_URL, 
+                        settings.LIVEKIT_API_KEY, 
+                        settings.LIVEKIT_API_SECRET.get_secret_value()
+                    ) as lkapi:
+                        await lkapi.room.delete_room(api.DeleteRoomRequest(room=room_name))
+                except Exception as e:
+                    logger.warning("auto_no_show: failed to delete room %s: %s", room_name, str(e))
+
+    logger.info("auto_no_show: marked=%d", count)
 
 
 @celery_app.task(

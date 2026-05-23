@@ -24,6 +24,8 @@ def generate_room_name(appointment_id: str) -> str:
     return f"appt_{appointment_id}_{suffix}"
 
 
+from livekit.api import AccessToken, VideoGrants
+
 def create_video_token(
     *,
     room: str,
@@ -34,23 +36,24 @@ def create_video_token(
     if not settings.LIVEKIT_URL or not settings.LIVEKIT_API_KEY or not settings.LIVEKIT_API_SECRET.get_secret_value():
         raise HTTPException(status_code=500, detail="Video provider is not configured")
 
-    now = datetime.now(timezone.utc)
-    exp = now + timedelta(seconds=int(ttl_seconds or settings.LIVEKIT_TOKEN_TTL_SECONDS))
-    payload = {
-        "iss": settings.LIVEKIT_API_KEY,
-        "sub": identity,
-        "nbf": int(now.timestamp()),
-        "exp": int(exp.timestamp()),
-        "metadata": json.dumps(metadata),
-        "video": {
-            "roomJoin": True,
-            "room": room,
-            "canPublish": True,
-            "canSubscribe": True,
-            "canPublishData": True,
-        },
-    }
-    return jwt.encode(payload, settings.LIVEKIT_API_SECRET.get_secret_value(), algorithm="HS256")
+    grant = VideoGrants(
+        room_join=True,
+        room=room,
+        can_publish=True,
+        can_subscribe=True,
+        can_publish_data=True,
+    )
+    
+    access_token = AccessToken(
+        settings.LIVEKIT_API_KEY,
+        settings.LIVEKIT_API_SECRET.get_secret_value()
+    )
+    access_token.identity = identity
+    access_token.metadata = json.dumps(metadata)
+    access_token.grants = grant
+    access_token.ttl = timedelta(seconds=int(ttl_seconds or settings.LIVEKIT_TOKEN_TTL_SECONDS))
+    
+    return access_token.to_jwt()
 
 
 async def ensure_video_room(db, appointment: dict) -> str:
