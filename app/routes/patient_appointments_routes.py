@@ -19,8 +19,8 @@ from app.services.cache_service import (
     patient_appointment_detail_key,
     patient_appointments_list_key,
 )
-from app.schemas.appointment_schema import PatientRescheduleIn, PatientAppointmentBookIn, PaymentCreateOrderIn
-from app.services.payment_order_service import create_payment_order_for_appointment
+from app.schemas.appointment_schema import PatientRescheduleIn, PatientAppointmentBookIn, PaymentCreateOrderIn, PaymentVerifyIn
+from app.services.payment_order_service import create_payment_order_for_appointment, verify_payment_signature_and_confirm
 from app.services.refund_service import enqueue_refund_processing
 from app.utils.appointment_rules import (
     build_patient_access_expiry,
@@ -926,6 +926,39 @@ async def patient_create_payment_order(
         appointment=appt,
         appointment_id=payload.appointment_id,
         now=utc_now(),
+    )
+
+
+@router.post(
+    "/payments/verify",
+    dependencies=[rl(settings.RL_PATIENT_MUTATION_TIMES, settings.RL_PATIENT_MUTATION_SECONDS)],
+)
+async def patient_verify_payment(
+    payload: PaymentVerifyIn,
+    current=Depends(get_current_patient),
+):
+    db = get_db()
+
+    try:
+        appt_oid = ObjectId(payload.appointment_id)
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid appointment_id")
+
+    appt = await db.appointments.find_one(
+        {
+            "_id": appt_oid,
+            "patient_user_id": current["_id"],
+        }
+    )
+    if not appt:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    return await verify_payment_signature_and_confirm(
+        db,
+        appointment_id=payload.appointment_id,
+        razorpay_payment_id=payload.razorpay_payment_id,
+        razorpay_order_id=payload.razorpay_order_id,
+        razorpay_signature=payload.razorpay_signature,
     )
 
 

@@ -44,14 +44,16 @@ def create_video_token(
         can_publish_data=True,
     )
     
-    access_token = AccessToken(
-        settings.LIVEKIT_API_KEY,
-        settings.LIVEKIT_API_SECRET.get_secret_value()
+    access_token = (
+        AccessToken(
+            settings.LIVEKIT_API_KEY,
+            settings.LIVEKIT_API_SECRET.get_secret_value()
+        )
+        .with_identity(identity)
+        .with_metadata(json.dumps(metadata))
+        .with_grants(grant)
+        .with_ttl(timedelta(seconds=int(ttl_seconds or settings.LIVEKIT_TOKEN_TTL_SECONDS)))
     )
-    access_token.identity = identity
-    access_token.metadata = json.dumps(metadata)
-    access_token.grants = grant
-    access_token.ttl = timedelta(seconds=int(ttl_seconds or settings.LIVEKIT_TOKEN_TTL_SECONDS))
     
     return access_token.to_jwt()
 

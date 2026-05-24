@@ -65,11 +65,18 @@ else:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import asyncio
+    from app.services.stuck_payments_cron import start_stuck_payment_recovery_cron
+    
     await connect_db()
     await bootstrap_admin_if_needed(get_db())
     await connect_redis()
     await FastAPILimiter.init(get_redis(), prefix="rate", http_callback=_rate_limit_callback)
+    
+    cron_task = asyncio.create_task(start_stuck_payment_recovery_cron())
     yield
+    cron_task.cancel()
+    
     await FastAPILimiter.close()
     await close_redis()
     await close_db()

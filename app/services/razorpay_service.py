@@ -265,3 +265,21 @@ def verify_webhook_signature(body: bytes, signature: str) -> bool:
     except SignatureVerificationError:
         logger.warning("Razorpay webhook signature verification failed")
         return False
+
+
+def verify_payment_signature(razorpay_order_id: str, razorpay_payment_id: str, razorpay_signature: str) -> bool:
+    """
+    Verify Razorpay payment signature returned in the checkout onSuccess callback.
+    """
+    if not razorpay_order_id or not razorpay_payment_id or not razorpay_signature:
+        return False
+    try:
+        client.utility.verify_payment_signature({
+            'razorpay_order_id': razorpay_order_id,
+            'razorpay_payment_id': razorpay_payment_id,
+            'razorpay_signature': razorpay_signature
+        })
+        return True
+    except SignatureVerificationError:
+        logger.warning("Razorpay payment signature verification failed")
+        return False

@@ -1,4 +1,7 @@
 from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
 
 from fastapi import HTTPException
 
@@ -11,6 +14,7 @@ from app.services.payment_order_cache_service import (
 )
 from app.services.razorpay_service import create_order as create_razorpay_order
 from app.utils.time import ensure_utc
+from app.services.razorpay_service import verify_payment_signature
 
 
 async def create_payment_order_for_appointment(
@@ -136,3 +140,95 @@ async def create_payment_order_for_appointment(
         return response
     finally:
         await release_order_lock(appointment_id, lock_owner)
+
+
+async def verify_payment_signature_and_confirm(
+    db,
+    appointment_id: str,
+    razorpay_payment_id: str,
+    razorpay_order_id: str,
+    razorpay_signature: str,
+) -> dict:
+    from app.core.config import settings
+    if not settings.ENABLE_SYNC_VERIFICATION:
+        return {"status": "pending"}
+
+    if not verify_payment_signature(razorpay_order_id, razorpay_payment_id, razorpay_signature):
+        raise HTTPException(status_code=400, detail="Invalid payment signature")
+
+    from bson import ObjectId
+    appt_oid = ObjectId(appointment_id)
+    appt = await db.appointments.find_one({"_id": appt_oid})
+    
+    if not appt:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    # 🔴 CRITICAL: bind order to appointment BEFORE trusting any frontend input
+    if appt.get("payment_order_id") != razorpay_order_id:
+        logger.error(
+            "Payment spoofing attempt",
+            extra={
+                "appointment_id": appointment_id,
+                "expected_order_id": appt.get("payment_order_id"),
+                "received_order_id": razorpay_order_id,
+            }
+        )
+        raise HTTPException(status_code=403, detail="Invalid payment reference")
+
+    # (Optional but Elite) Bind Payment ID Too
+    if appt.get("payment_id") and appt["payment_id"] != razorpay_payment_id:
+        raise HTTPException(status_code=409, detail="Payment already processed with different ID")
+
+    from app.services.razorpay_service import client
+    import asyncio
+    try:
+        payment_entity = await asyncio.to_thread(client.payment.fetch, razorpay_payment_id)
+    except Exception as e:
+        logger.warning(
+            "Razorpay API fetch failed for payment_id=%s: %s",
+            razorpay_payment_id, str(e),
+            exc_info=True
+        )
+        return {"status": "pending"}
+
+    # Validate against Razorpay response
+    if payment_entity.get("order_id") != razorpay_order_id:
+        raise HTTPException(status_code=400, detail="Order mismatch from Razorpay")
+
+    if payment_entity.get("status") != "captured":
+        return {"status": "pending"}
+
+    if payment_entity.get("currency") != "INR":
+        raise HTTPException(status_code=400, detail="Invalid currency")
+
+    expected_fee = appt.get("consultation_fee")
+    if expected_fee is not None:
+        expected_paise = int(expected_fee) * 100
+        if int(payment_entity.get("amount", 0)) != expected_paise:
+            raise HTTPException(status_code=400, detail="Amount mismatch")
+
+    logger.info({
+        "appointment_id": appointment_id,
+        "payment_id": razorpay_payment_id,
+        "status": payment_entity.get("status"),
+        "verified_via": "sync",
+    })
+
+    # Synthesize webhook payload
+    payload = {
+        "event": "payment.captured",
+        "payload": {
+            "payment": {
+                "entity": payment_entity
+            }
+        }
+    }
+
+    # Process it synchronously via the webhook handler
+    from app.routes.webhook_routes import _handle_payment_captured
+    result = await _handle_payment_captured(payload)
+
+    if isinstance(result, dict) and result.get("status") in ("missing_amount_ignored", "amount_mismatch_ignored"):
+        raise HTTPException(status_code=400, detail="Payment verification failed: Amount mismatch")
+
+    return {"status": "verified"}

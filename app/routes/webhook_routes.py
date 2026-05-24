@@ -198,7 +198,11 @@ async def _handle_payment_captured(payload: dict):
     # Concurrency-safe update
     # ---------------------------
     update_res = await db.appointments.update_one(
-        {"_id": appt_id, "status": "pending_payment"},
+        {
+            "_id": appt_id,
+            "payment_status": {"$ne": "paid"},
+            "status": {"$ne": "cancelled"}
+        },
         {"$set": update_set},
     )
 
@@ -236,12 +240,19 @@ async def _handle_payment_captured(payload: dict):
                         appt_id,
                     )
                 return {"status": "refund_triggered"}
-                
-        logger.warning(
-            "payment.captured: could not update appointment_id=%s — already modified",
-            appt_id,
-        )
-        return
+        
+        if current_appt and current_appt.get("payment_status") == "paid":
+            if current_appt.get("payment_events_dispatched"):
+                logger.info("payment.captured: already confirmed and events dispatched, appointment_id=%s", appt_id)
+                return
+            else:
+                logger.info("payment.captured: already paid but events not dispatched, resuming event dispatch for appointment_id=%s", appt_id)
+        else:
+            logger.warning(
+                "payment.captured: could not update appointment_id=%s — already modified and not paid",
+                appt_id,
+            )
+            return
 
     logger.info("payment.captured: confirmed appointment_id=%s", appt_id)
 
@@ -328,6 +339,8 @@ async def _handle_payment_captured(payload: dict):
     }
     await notify_doctor(doctor_id, EVENT_PAYMENT_CONFIRMED, event_data)
     await notify_doctor(doctor_id, EVENT_APPOINTMENT_BOOKED, event_data)
+
+    await db.appointments.update_one({"_id": appt_id}, {"$set": {"payment_events_dispatched": True}})
 
 
 async def _handle_payment_failed(payload: dict):

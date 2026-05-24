@@ -146,6 +146,9 @@ class Settings(BaseSettings):
     RAZORPAY_KEY_ID: str
     RAZORPAY_KEY_SECRET: SecretStr
     RAZORPAY_WEBHOOK_SECRET: SecretStr
+    
+    # Feature Flags
+    ENABLE_SYNC_VERIFICATION: bool = True
 
     # Email (Resend)
     RESEND_API_KEY: str | None = None

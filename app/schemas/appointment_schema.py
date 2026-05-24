@@ -131,6 +131,12 @@ class PaymentConfirmIn(BaseModel):
 class PaymentCreateOrderIn(BaseModel):
     appointment_id: str
 
+class PaymentVerifyIn(BaseModel):
+    appointment_id: str
+    razorpay_payment_id: str
+    razorpay_order_id: str
+    razorpay_signature: str
+
 
 # -----------------------------
 # Public Appointment View
