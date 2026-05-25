@@ -339,6 +339,7 @@ async def public_video_token(
         join_token = create_video_token(
             room=room,
             identity=identity,
+            name=appt.get("patient_name") or "Patient",
             metadata={"appointment_id": appointment_id, "role": "patient", "trace_id": trace_id},
             ttl_seconds=7200,
         )

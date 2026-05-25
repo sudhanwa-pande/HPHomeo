@@ -30,6 +30,7 @@ def create_video_token(
     *,
     room: str,
     identity: str,
+    name: str | None = None,
     metadata: dict[str, Any],
     ttl_seconds: int | None = None,
 ) -> str:
@@ -50,6 +51,7 @@ def create_video_token(
             settings.LIVEKIT_API_SECRET.get_secret_value()
         )
         .with_identity(identity)
+        .with_name(name or identity)
         .with_metadata(json.dumps(metadata))
         .with_grants(grant)
         .with_ttl(timedelta(seconds=int(ttl_seconds or settings.LIVEKIT_TOKEN_TTL_SECONDS)))

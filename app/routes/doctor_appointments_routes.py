@@ -708,6 +708,7 @@ async def doctor_video_token(
         join_token = create_video_token(
             room=room,
             identity=identity,
+            name=doctor.get("full_name") or "Doctor",
             metadata={"appointment_id": str(appt["_id"]), "role": "doctor", "trace_id": trace_id},
             ttl_seconds=7200,
         )
