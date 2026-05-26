@@ -338,7 +338,7 @@ async def auto_no_show():
     if not docs:
         return
 
-    from app.services.sse_service import notify_appointment, notify_patient
+    from app.services.event_bus import notify_appointment, notify_patient
     from app.core.config import settings
 
     count = 0
@@ -897,3 +897,66 @@ async def reconcile_captured_payments():
         "reconcile_captured_payments: scanned=%d confirmed=%d skipped=%d",
         len(appointments), confirmed, skipped,
     )
+
+@celery_app.task(
+    name="app.worker.tasks.appointment_tasks.auto_complete_appointment",
+    base=BaseTaskWithDLQ,
+    autoretry_for=(Exception,),
+    max_retries=3,
+    retry_backoff=True,
+    retry_jitter=True,
+)
+@async_task
+async def auto_complete_appointment(appointment_id: str):
+    db = await get_task_db()
+    now = utc_now()
+    
+    try:
+        appt_oid = ObjectId(str(appointment_id))
+    except Exception:
+        return
+        
+    appt = await db.appointments.find_one({"_id": appt_oid})
+    if not appt:
+        return
+        
+    if (
+        appt.get("status") == "confirmed" 
+        and appt.get("call_status") == "ended" 
+        and appt.get("call_connected_at") is not None
+    ):
+        from app.services.event_bus import notify_appointment, notify_patient
+        
+        result = await db.appointments.update_one(
+            {"_id": appt_oid, "status": "confirmed"},
+            {
+                "$set": {
+                    "status": "completed",
+                    "completed_at": now,
+                    "updated_at": now,
+                }
+            }
+        )
+        
+        if result.modified_count > 0:
+            logger.info("auto_complete_appointment: auto-completed appointment_id=%s", appointment_id)
+            
+            from app.services.cache_service import invalidate_doctor_cache, invalidate_patient_cache
+            from datetime import timezone
+            
+            scheduled_at = appt.get("scheduled_at")
+            if scheduled_at:
+                if scheduled_at.tzinfo is None:
+                    scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
+                await invalidate_doctor_cache(str(appt.get("doctor_id")), day=scheduled_at.date().isoformat())
+            if appt.get("patient_user_id"):
+                await invalidate_patient_cache(str(appt["patient_user_id"]))
+                
+            event_data = {
+                "appointment_id": appointment_id,
+                "status": "completed",
+                "completed_at": now.isoformat(),
+            }
+            await notify_appointment(appointment_id, "appointment_completed", event_data)
+            if appt.get("patient_user_id"):
+                await notify_patient(str(appt["patient_user_id"]), "appointment_completed", event_data)

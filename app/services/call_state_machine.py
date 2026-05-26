@@ -455,6 +455,14 @@ async def handle_room_finished(room_name: str) -> None:
 
     await _emit_state_change(appt, "ended", 0, [], now)
 
+    # Trigger auto-complete if it was a real call (≥ 1 min connection time is usually good, but we just check if it connected)
+    if appt.get("call_connected_at"):
+        from app.worker.tasks.appointment_tasks import auto_complete_appointment
+        auto_complete_appointment.apply_async(
+            args=[appointment_id],
+            countdown=1800,  # 30 minutes
+        )
+
 
 async def handle_manual_end(appointment_id: str, doctor_id: str) -> dict[str, Any]:
     """Doctor manually ends the call."""
@@ -518,6 +526,14 @@ async def handle_manual_end(appointment_id: str, doctor_id: str) -> dict[str, An
     scheduled_at = ensure_utc(appt.get("scheduled_at"))
     if scheduled_at:
         await invalidate_doctor_cache(doctor_id, day=scheduled_at.date().isoformat())
+
+    # Trigger auto-complete if it was a real call
+    if appt.get("call_connected_at"):
+        from app.worker.tasks.appointment_tasks import auto_complete_appointment
+        auto_complete_appointment.apply_async(
+            args=[appointment_id],
+            countdown=1800,  # 30 minutes
+        )
 
     return {
         "message": "call_ended",
