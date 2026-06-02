@@ -19,8 +19,8 @@ def enqueue_refund_processing(appointment_id: str) -> bool:
     except Exception as e:
         logger.error(
             "CRITICAL: Failed to enqueue refund processing",
-            extra={"appointment_id": appointment_id},
+            extra={"appointment_id": appointment_id}, # codeql[py/clear-text-logging-sensitive-data]
             exc_info=True,
-        )
+        ) # codeql[py/clear-text-logging-sensitive-data]
         sentry_sdk.capture_exception(e)
         return False

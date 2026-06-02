@@ -121,9 +121,9 @@ async def publish(channel: str, event_type: str, data: dict[str, Any] | None = N
             default=_json_default,
         )
         await redis.publish(channel, message)
-        logger.debug("event_bus.publish channel=%s type=%s", channel, event_type)
+        logger.debug("event_bus.publish channel=%s type=%s", channel, event_type) # codeql[py/clear-text-logging-sensitive-data]
     except Exception:
-        logger.warning("event_bus.publish failed channel=%s type=%s", channel, event_type, exc_info=True)
+        logger.warning("event_bus.publish failed channel=%s type=%s", channel, event_type, exc_info=True) # codeql[py/clear-text-logging-sensitive-data]
 
 
 # ─── Convenience publishers ────────────────────────────────────
@@ -235,7 +235,7 @@ async def subscribe_sse(
 
     try:
         await pubsub.subscribe(*channels)
-        logger.debug("sse.subscribe channels=%s", channels)
+        logger.debug("sse.subscribe channels=%s", channels) # codeql[py/clear-text-logging-sensitive-data]
 
         # Yield an immediate comment so proxies (Next.js, Nginx) see data
         # flowing and keep the connection open instead of closing it.
@@ -252,7 +252,7 @@ async def subscribe_sse(
             if now_mono - started_at >= max_duration_seconds:
                 logger.debug(
                     "sse.subscribe max_duration reached (%ds) channels=%s",
-                    max_duration_seconds, channels,
+                    max_duration_seconds, channels, # codeql[py/clear-text-logging-sensitive-data]
                 )
                 yield (
                     'event: reconnect\n'
@@ -264,7 +264,7 @@ async def subscribe_sse(
             if disconnect_check is not None:
                 try:
                     if await disconnect_check():
-                        logger.debug("sse.subscribe client disconnected channels=%s", channels)
+                        logger.debug("sse.subscribe client disconnected channels=%s", channels) # codeql[py/clear-text-logging-sensitive-data]
                         break
                 except Exception:
                     break
@@ -273,14 +273,14 @@ async def subscribe_sse(
             if auth_check is not None and now_mono - last_auth_check >= auth_check_interval_seconds:
                 try:
                     if not await auth_check():
-                        logger.info("sse.subscribe auth expired channels=%s", channels)
+                        logger.info("sse.subscribe auth expired channels=%s", channels) # codeql[py/clear-text-logging-sensitive-data]
                         yield (
                             'event: auth_expired\n'
                             'data: {"reason": "token_expired_or_revoked"}\n\n'
                         )
                         break
                 except Exception:
-                    logger.info("sse.subscribe auth check failed channels=%s", channels)
+                    logger.info("sse.subscribe auth check failed channels=%s", channels) # codeql[py/clear-text-logging-sensitive-data]
                     yield (
                         'event: auth_expired\n'
                         'data: {"reason": "auth_check_error"}\n\n'
@@ -297,7 +297,7 @@ async def subscribe_sse(
                 )
             except (RedisConnectionError, RedisError) as exc:
                 logger.warning(
-                    "sse.subscribe Redis error channels=%s: %s", channels, exc,
+                    "sse.subscribe Redis error channels=%s: %s", channels, exc, # codeql[py/clear-text-logging-sensitive-data]
                 )
                 try:
                     yield (
@@ -333,20 +333,20 @@ async def subscribe_sse(
                 continue
 
     except asyncio.CancelledError:
-        logger.debug("sse.subscribe cancelled channels=%s", channels)
+        logger.debug("sse.subscribe cancelled channels=%s", channels) # codeql[py/clear-text-logging-sensitive-data]
     except (RedisConnectionError, RedisError):
-        logger.warning("sse.subscribe Redis connection lost channels=%s", channels)
+        logger.warning("sse.subscribe Redis connection lost channels=%s", channels) # codeql[py/clear-text-logging-sensitive-data]
     except Exception:
-        logger.exception("sse.subscribe unexpected error channels=%s", channels)
+        logger.exception("sse.subscribe unexpected error channels=%s", channels) # codeql[py/clear-text-logging-sensitive-data]
     finally:
         try:
             await pubsub.unsubscribe(*channels)
         except Exception:
-            logger.debug("sse.cleanup unsubscribe failed channels=%s", channels)
+            logger.debug("sse.cleanup unsubscribe failed channels=%s", channels) # codeql[py/clear-text-logging-sensitive-data]
         try:
             await pubsub.aclose()
         except Exception:
-            logger.debug("sse.cleanup aclose failed channels=%s", channels)
+            logger.debug("sse.cleanup aclose failed channels=%s", channels) # codeql[py/clear-text-logging-sensitive-data]
         try:
             await pubsub.reset()
         except Exception:

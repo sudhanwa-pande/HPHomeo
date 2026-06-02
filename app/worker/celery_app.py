@@ -80,6 +80,9 @@ celery_app.conf.update(
         "app.worker.tasks.appointment_tasks.send_12hr_whatsapp_reminders": {
             "queue": "notifications",
         },
+        "app.worker.tasks.appointment_tasks.enforce_disconnect_timeout": {
+            "queue": "default",
+        },
         "app.worker.tasks.*": {
             "queue": "default",
             "exchange": "default",
@@ -140,4 +143,8 @@ celery_app.conf.beat_schedule = {
         "task": "app.worker.tasks.appointment_tasks.reconcile_captured_payments",
         "schedule": 1800.0,
     },
+    "write-beat-heartbeat": {
+        "task": "app.worker.tasks.cache_tasks.write_beat_heartbeat",
+        "schedule": 300.0,
+    }
 }

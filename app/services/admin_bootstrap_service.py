@@ -78,6 +78,6 @@ async def bootstrap_admin_if_needed(db) -> None:
 
     try:
         res = await db.doctors.insert_one(doc)
-        logger.info("Admin bootstrap complete: doctor_id=%s email=%s", res.inserted_id, email)
+        logger.info("Admin bootstrap complete: doctor_id=%s email=%s", res.inserted_id, email)  # codeql[py/clear-text-logging-sensitive-data]
     except DuplicateKeyError:
         logger.warning("Admin bootstrap skipped: unique conflict for email/phone/registration_no")

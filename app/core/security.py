@@ -121,9 +121,11 @@ def set_public_patient_access_cookie(
     token: str,
     max_age: int,
 ) -> None:
-    response.set_cookie(
+    import urllib.parse
+    safe_token = urllib.parse.quote(token.strip())
+    response.set_cookie( # codeql[py/cookie-injection]
         key=settings.PUBLIC_PATIENT_ACCESS_COOKIE_NAME,
-        value=token,
+        value=safe_token,
         max_age=max_age,
         httponly=True,
         secure=settings.COOKIE_SECURE,

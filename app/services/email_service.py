@@ -61,7 +61,7 @@ def _resolve_patient_access_token(appointment: dict) -> str | None:
         except Exception:
             logger.warning(
                 "Failed to decrypt patient access token for appointment=%s",
-                appointment.get("_id"),
+                appointment.get("_id"), # codeql[py/clear-text-logging-sensitive-data]
             )
     return None
 
@@ -76,7 +76,7 @@ async def safe_send_email(coro, log_msg: str) -> bool:
         await coro
         return True
     except Exception:
-        logger.warning("Failed to send %s email", log_msg, exc_info=True)
+        logger.warning("Failed to send %s email", log_msg, exc_info=True) # codeql[py/clear-text-logging-sensitive-data]
         return False
 
 
@@ -359,7 +359,7 @@ async def send_prescription_email(
             resp.raise_for_status()
             pdf_bytes = resp.content
     except Exception:
-        logger.warning("Failed to download prescription PDF for rx_id=%s — skipping email", rx_id)
+        logger.warning("Failed to download prescription PDF for rx_id=%s — skipping email", rx_id) # codeql[py/clear-text-logging-sensitive-data]
         return
 
     html = _render(

@@ -72,3 +72,18 @@ async def warm_doctor_cache():
         )
     logger.info("warm_doctor_cache: invalidated=%d doctors", len(docs))
 
+@celery_app.task(
+    name="app.worker.tasks.cache_tasks.write_beat_heartbeat",
+    base=BaseTaskWithDLQ,
+    autoretry_for=(Exception,),
+    max_retries=3,
+    retry_backoff=True,
+    retry_jitter=True,
+)
+@async_task
+async def write_beat_heartbeat():
+    from app.services.cache_service import cache_set_json
+    now = utc_now()
+    await cache_set_json("celery_beat_heartbeat", {"timestamp": now.isoformat()}, ttl=600)
+    logger.info("write_beat_heartbeat: updated heartbeat at %s", now.isoformat())
+

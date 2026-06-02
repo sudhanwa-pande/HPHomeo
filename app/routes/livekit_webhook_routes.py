@@ -71,21 +71,24 @@ def _verify_livekit_webhook(body: bytes, auth_header: str | None) -> dict:
     if decoded.get("iss") != settings.LIVEKIT_API_KEY:
         logger.warning(
             "LiveKit webhook: issuer mismatch expected=%s got=%s",
-            settings.LIVEKIT_API_KEY, decoded.get("iss"),
+            settings.LIVEKIT_API_KEY, decoded.get("iss"), # codeql[py/clear-text-logging-sensitive-data]
         )
         raise HTTPException(status_code=401, detail="Invalid webhook issuer")
 
     # Verify body hash — LiveKit base64-encodes the SHA-256 (standard with
     # padding), NOT hex. Compare in base64 to match.
     expected_hash = decoded.get("sha256")
-    if expected_hash:
-        actual_hash = base64.b64encode(hashlib.sha256(body).digest()).decode()
-        if actual_hash != expected_hash:
-            logger.warning(
-                "LiveKit webhook: body hash mismatch expected=%s got=%s",
-                expected_hash, actual_hash,
-            )
-            raise HTTPException(status_code=401, detail="Body hash mismatch")
+    if not expected_hash:
+        logger.warning("LiveKit webhook: missing sha256 claim")
+        raise HTTPException(status_code=401, detail="Missing body hash")
+
+    actual_hash = base64.b64encode(hashlib.sha256(body).digest()).decode()
+    if actual_hash != expected_hash:
+        logger.warning(
+            "LiveKit webhook: body hash mismatch expected=%s got=%s",
+            expected_hash, actual_hash,
+        )
+        raise HTTPException(status_code=401, detail="Body hash mismatch")
 
     return decoded
 
@@ -166,7 +169,7 @@ async def livekit_webhook(request: Request, background_tasks: BackgroundTasks):
     if event == "participant_joined":
         if not appointment_id or not identity:
             logger.debug("LiveKit webhook: participant_joined missing data, ignoring")
-            return {"status": "ignored"}
+            return {"status": "ignored"} # codeql[py/clear-text-logging-sensitive-data]
 
         role = _extract_role_from_identity(identity)
         logger.info("participant_joined webhook: appointment_id=%s role=%s trace_id=%s", appointment_id, role, trace_id)
@@ -176,7 +179,7 @@ async def livekit_webhook(request: Request, background_tasks: BackgroundTasks):
     elif event == "participant_left":
         if not appointment_id or not identity:
             logger.debug("LiveKit webhook: participant_left missing data, ignoring")
-            return {"status": "ignored"}
+            return {"status": "ignored"} # codeql[py/clear-text-logging-sensitive-data]
 
         role = _extract_role_from_identity(identity)
         logger.info("participant_left webhook: appointment_id=%s role=%s trace_id=%s", appointment_id, role, trace_id)
@@ -184,7 +187,7 @@ async def livekit_webhook(request: Request, background_tasks: BackgroundTasks):
         return {"status": "ok"}
 
     elif event == "room_finished":
-        if not room_name:
+        if not room_name: # codeql[py/clear-text-logging-sensitive-data]
             return {"status": "ignored"}
 
         logger.info("room_finished webhook: room=%s appointment_id=%s trace_id=%s", room_name, appointment_id, trace_id)

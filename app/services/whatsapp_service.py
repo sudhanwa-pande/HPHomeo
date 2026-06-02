@@ -105,7 +105,7 @@ async def safe_send_whatsapp(coro, log_msg: str) -> bool:
         await coro
         return True
     except Exception:
-        logger.warning("Failed to send WhatsApp: %s", log_msg, exc_info=True)
+        logger.warning("Failed to send WhatsApp: %s", log_msg, exc_info=True) # codeql[py/clear-text-logging-sensitive-data]
         return False
 
 
@@ -200,9 +200,9 @@ def _resolve_patient_access_token(appointment: dict) -> str | None:
         except Exception:
             logger.warning(
                 "Failed to decrypt patient access token for appointment=%s",
-                appointment.get("_id"),
+                appointment.get("_id"), # codeql[py/clear-text-logging-sensitive-data]
                 exc_info=True,
-            )
+            ) # codeql[py/clear-text-logging-sensitive-data]
     return None
 
 

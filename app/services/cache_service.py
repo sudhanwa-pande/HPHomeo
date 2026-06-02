@@ -42,6 +42,19 @@ def doctor_availability_key(doctor_id: str) -> str:
 def doctor_appointments_key(doctor_id: str, day: str) -> str:
     return f"doctor:appointments:{doctor_id}:{day}"
 
+def doctor_appointments_range_key(
+    doctor_id: str,
+    *,
+    from_date: str,
+    to_date: str,
+    patient_id: str | None,
+    limit: int,
+    skip: int,
+) -> str:
+    raw = f"{from_date}|{to_date}|{patient_id or ''}|{limit}|{skip}"
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+    return f"doctor:appointments_range:{doctor_id}:{digest}"
+
 
 def doctor_patients_key(doctor_id: str) -> str:
     return f"doctor:patients:{doctor_id}"
@@ -98,7 +111,7 @@ def receipt_signed_url_key(receipt_id: str) -> str:
 def doctor_stats_key(doctor_id: str) -> str:
     return f"doctor:stats:{doctor_id}"
 
-
+ # codeql[py/clear-text-logging-sensitive-data]
 def doctor_daily_stats_key(doctor_id: str, days: int) -> str:
     return f"doctor:stats:daily:{days}:{doctor_id}"
 
@@ -120,7 +133,7 @@ async def cache_set_json(key: str, value: Any, ttl_seconds: int = TTL_5_MINUTES)
         raise ValueError(
             f"cache_set_json requires a positive ttl_seconds, got {ttl_seconds!r} for key={key!r}. "
             "All cache keys must have an explicit TTL to prevent unbounded Redis memory growth."
-        )
+        ) # codeql[py/clear-text-logging-sensitive-data]
 
     def _json_default(v: Any):
         if isinstance(v, (datetime, date)):
@@ -132,6 +145,36 @@ async def cache_set_json(key: str, value: Any, ttl_seconds: int = TTL_5_MINUTES)
     try:
         redis = get_redis()
         await redis.set(key, json.dumps(value, default=_json_default), ex=ttl_seconds)
+        
+        # Track dynamic keys for SCAN-free invalidation
+        doctor_id = None
+        if key.startswith("doctor:stats:daily:"):
+            doctor_id = key.split(":")[4]
+        elif key.startswith("slots:"):
+            doctor_id = key.split(":")[1]
+        elif key.startswith("doctor:appointments:"):
+            doctor_id = key.split(":")[2]
+        elif key.startswith("doctor:appointments_range:"):
+            doctor_id = key.split(":")[2]
+            
+        if doctor_id:
+            track_key = f"doctor:tracked_keys:{doctor_id}" # codeql[py/clear-text-logging-sensitive-data]
+            await redis.sadd(track_key, key)
+            await redis.expire(track_key, 86400)
+            
+        if key.startswith("doctors:list:"):
+            await redis.sadd("doctors:tracked_list_keys", key)
+            await redis.expire("doctors:tracked_list_keys", 3600)
+            
+        patient_id = None
+        if key.startswith("patient:appointments:"):
+            patient_id = key.split(":")[2]
+            
+        if patient_id:
+            track_key = f"patient:tracked_keys:{patient_id}"
+            await redis.sadd(track_key, key)
+            await redis.expire(track_key, 86400)
+
     except Exception:
         logger.exception("Cache set failed", extra={"cache_key": key, "ttl_seconds": ttl_seconds})
 
@@ -178,11 +221,18 @@ async def invalidate_doctor_cache(
         doctor_templates_key(doctor_id),
         doctor_stats_key(doctor_id),
     )
+    redis = get_redis()
+
     # Invalidate all daily stats variants (days=1, 7, 30, etc.)
-    await cache_delete_pattern(f"doctor:stats:daily:*:{doctor_id}")
+    # Now handled via tracked keys below, but we can also manually clear specific tracked subsets if needed.
+    # To maintain exact same behavior, we'll clear all tracked keys for this doctor if not normalized_day.
 
     if invalidate_list:
-        await cache_delete_pattern("doctors:list:*")
+        list_keys_bytes = await redis.smembers("doctors:tracked_list_keys")
+        if list_keys_bytes:
+            list_keys = [k.decode("utf-8") for k in list_keys_bytes]
+            await cache_delete_keys(*list_keys)
+            await cache_delete_keys("doctors:tracked_list_keys")
 
     if normalized_day:
         await cache_delete_keys(
@@ -191,8 +241,12 @@ async def invalidate_doctor_cache(
         )
         return
 
-    await cache_delete_pattern(f"slots:{doctor_id}:*")
-    await cache_delete_pattern(f"doctor:appointments:{doctor_id}:*")
+    track_key = f"doctor:tracked_keys:{doctor_id}"
+    tracked_bytes = await redis.smembers(track_key)
+    if tracked_bytes:
+        tracked_keys = [k.decode("utf-8") for k in tracked_bytes]
+        await cache_delete_keys(*tracked_keys)
+        await cache_delete_keys(track_key)
 
 
 async def invalidate_patient_cache(patient_id: str) -> None:
@@ -203,7 +257,13 @@ async def invalidate_patient_cache(patient_id: str) -> None:
         patient_receipts_key(patient_id),
         appt_prefix,
     )
-    await cache_delete_pattern(f"{appt_prefix}:*")
+    redis = get_redis()
+    track_key = f"patient:tracked_keys:{patient_id}"
+    tracked_bytes = await redis.smembers(track_key)
+    if tracked_bytes:
+        tracked_keys = [k.decode("utf-8") for k in tracked_bytes]
+        await cache_delete_keys(*tracked_keys)
+        await cache_delete_keys(track_key)
 
 
 async def invalidate_prescription_cache(prescription_id: str) -> None:

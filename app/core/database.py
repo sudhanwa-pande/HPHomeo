@@ -138,6 +138,7 @@ async def connect_db():
     )
     # Video call lifecycle queries (optional global ops)
     await _db.appointments.create_index("call_status", sparse=True)
+    await _db.appointments.create_index("video_room", unique=True, sparse=True)
     
     # Refund lookup
     await _db.appointments.create_index(

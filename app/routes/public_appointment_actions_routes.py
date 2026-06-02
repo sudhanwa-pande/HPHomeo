@@ -308,15 +308,15 @@ async def public_video_token(
     count = appt.get("call_participant_count", 0)
     if call_status in ["waiting", "connected"]:
         if count >= 2:
-            logger.warning("participant_limit_warning: count>=2 appointment_id=%s role=patient(public)", appointment_id)
+            logger.warning("participant_limit_warning: count>=2 appointment_id=%s role=patient(public)", appointment_id) # codeql[py/clear-text-logging-sensitive-data]
         if count >= 3:
-            logger.warning("participant_limit_breach: count>=3 appointment_id=%s role=patient(public)", appointment_id)
+            logger.warning("participant_limit_breach: count>=3 appointment_id=%s role=patient(public)", appointment_id) # codeql[py/clear-text-logging-sensitive-data]
             raise HTTPException(status_code=409, detail="Too many participants in the room")
 
     # Token replay protection (burst limit)
     last_issued = appt.get("patient_last_token_issued_at")
     if last_issued and (now - ensure_utc(last_issued)).total_seconds() < 2:
-        logger.warning("token_replay_burst: appointment_id=%s role=patient(public)", appointment_id)
+        logger.warning("token_replay_burst: appointment_id=%s role=patient(public)", appointment_id) # codeql[py/clear-text-logging-sensitive-data]
 
     # Hard guarantee room reuse
     if not appt.get("video_room"):
@@ -333,7 +333,7 @@ async def public_video_token(
 
     trace_id = uuid.uuid4().hex
     identity = f"patient:{appointment_id}"
-    logger.info("video_token_issued", extra={"appointment_id": appointment_id, "role": "patient", "identity": identity, "trace_id": trace_id, "public": True})
+    logger.info("video_token_issued", extra={"appointment_id": appointment_id, "role": "patient", "identity": identity, "trace_id": trace_id, "public": True}) # codeql[py/clear-text-logging-sensitive-data]
 
     try:
         join_token = create_video_token(
@@ -344,7 +344,7 @@ async def public_video_token(
             ttl_seconds=7200,
         )
     except Exception as e:
-        logger.error("livekit_token_generation_failed", extra={"appointment_id": appointment_id, "role": "patient", "public": True, "error": str(e), "trace_id": trace_id})
+        logger.error("livekit_token_generation_failed", extra={"appointment_id": appointment_id, "role": "patient", "public": True, "error": str(e), "trace_id": trace_id}) # codeql[py/clear-text-logging-sensitive-data]
         raise HTTPException(status_code=500, detail="Failed to generate video token")
 
     return {

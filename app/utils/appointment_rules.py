@@ -86,4 +86,5 @@ async def get_patient_access_token(
     token = (public_patient_access_token or "").strip()
     if not token:
         raise HTTPException(status_code=401, detail="Patient access session required")
-    return token
+    import urllib.parse
+    return urllib.parse.unquote(token)

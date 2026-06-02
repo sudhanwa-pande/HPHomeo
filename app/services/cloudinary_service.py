@@ -76,25 +76,39 @@ class CloudinaryService:
 
         parsed = urlparse(url)
         path = unquote(parsed.path or "")
-        match = re.search(r"/upload/(?:v\d+/)?(.+)$", path)
-        if not match:
+        parts = path.split("/upload/", 1) # codeql[py/polynomial-redos]
+        if len(parts) < 2:
             return None
 
-        public_path = match.group(1)
+        public_path = parts[1]
+        if public_path.startswith("v") and "/" in public_path:
+            first_slash = public_path.find("/")
+            version_part = public_path[1:first_slash]
+            if version_part.isdigit():
+                public_path = public_path[first_slash + 1:]
+
         if "." in public_path:
             public_path = public_path.rsplit(".", 1)[0]
         return public_path or None
 
-    def extract_public_path_from_url(self, url: str) -> Optional[str]:
+    def extract_public_path_from_url(self, url: str) -> Optional[str]: # codeql[py/polynomial-redos]
         if not url:
             return None
 
         parsed = urlparse(url)
         path = unquote(parsed.path or "")
-        match = re.search(r"/upload/(?:v\d+/)?(.+)$", path)
-        if not match:
+        parts = path.split("/upload/", 1)
+        if len(parts) < 2:
             return None
-        return match.group(1) or None
+
+        public_path = parts[1]
+        if public_path.startswith("v") and "/" in public_path:
+            first_slash = public_path.find("/")
+            version_part = public_path[1:first_slash]
+            if version_part.isdigit():
+                public_path = public_path[first_slash + 1:]
+
+        return public_path or None
 
     # Signed prescription URLs expire after 15 minutes.  A fresh URL is
     # generated on every view request, so this does not affect usability

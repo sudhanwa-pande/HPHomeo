@@ -43,12 +43,7 @@ router = APIRouter(tags=["Prescriptions"])
 ALLOWED_CREATE_STATUSES = {"confirmed", "completed"}
 
 
-def _oid(x: Any) -> ObjectId:
-    try:
-        return x if isinstance(x, ObjectId) else ObjectId(str(x))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid id")
-
+from app.utils.mongo_utils import _oid
 
 def _serialize_prescription(p: Dict[str, Any]) -> Dict[str, Any]:
     p = dict(p)
@@ -222,7 +217,10 @@ async def doctor_create_prescription(
     return serialized
 
 
-@router.put("/doctor/appointments/{appointment_id}/prescription")
+@router.put(
+    "/doctor/appointments/{appointment_id}/prescription",
+    dependencies=[rl(settings.RL_DOCTOR_WRITE_TIMES, settings.RL_DOCTOR_WRITE_SECONDS)],
+)
 async def doctor_update_prescription(
     appointment_id: str,
     payload: PrescriptionUpsert,

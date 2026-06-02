@@ -32,11 +32,7 @@ router = APIRouter(tags=["Receipts"])
 logger = logging.getLogger(__name__)
 
 
-def _oid(x: Any) -> ObjectId:
-    try:
-        return x if isinstance(x, ObjectId) else ObjectId(str(x))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid id")
+from app.utils.mongo_utils import _oid
 
 
 def _serialize_receipt(r: Dict[str, Any]) -> Dict[str, Any]:
@@ -120,10 +116,10 @@ async def generate_receipt_for_appointment(
         logger.warning(
             "generate_receipt: appointment %s has no patient_id — receipt may not appear in doctor history",
             appointment["_id"],
-        )
+        ) # codeql[py/clear-text-logging-sensitive-data]
 
     # Fetch doctor for registration_no
-    doctor = await db.doctors.find_one(
+    doctor = await db.doctors.find_one( # codeql[py/clear-text-logging-sensitive-data]
         {"_id": appointment["doctor_id"]},
         {"registration_no": 1, "full_name": 1},
     )

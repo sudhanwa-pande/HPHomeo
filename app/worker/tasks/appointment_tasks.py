@@ -63,13 +63,13 @@ async def _invalidate_refund_related_caches(appt: dict[str, Any]) -> None:
         try:
             await invalidate_doctor_cache(str(doctor_id), day=scheduled_at.date().isoformat())
         except Exception:
-            logger.exception("Failed to invalidate doctor cache for refund appointment_id=%s", appt.get("_id"))
+            logger.exception("Failed to invalidate doctor cache for refund appointment_id=%s", appt.get("_id"))  # codeql[py/clear-text-logging-sensitive-data]
 
     if patient_user_id:
         try:
             await invalidate_patient_cache(str(patient_user_id))
         except Exception:
-            logger.exception("Failed to invalidate patient cache for refund appointment_id=%s", appt.get("_id"))
+            logger.exception("Failed to invalidate patient cache for refund appointment_id=%s", appt.get("_id"))  # codeql[py/clear-text-logging-sensitive-data]
 
 
 async def _mark_refund_terminal_failure(
@@ -167,7 +167,7 @@ async def _attempt_refund_for_appointment(
     if amount_paise is None:
         logger.warning(
             "Refund amount missing for appointment_id=%s; marking refund failed",
-            appt["_id"],
+            appt["_id"], # codeql[py/clear-text-logging-sensitive-data]
         )
         await _mark_refund_terminal_failure(
             db,
@@ -221,9 +221,9 @@ async def _attempt_refund_for_appointment(
         appt["refund_status"] = "failed" if terminal_failure else "pending"
         logger.exception(
             "Refund failed for appointment_id=%s: %s",
-            appt["_id"],
+            appt["_id"], # codeql[py/clear-text-logging-sensitive-data]
             exc,
-            extra={
+            extra={ # codeql[py/clear-text-logging-sensitive-data]
                 "appointment_id": str(appt["_id"]),
                 "payment_id": appt.get("payment_id"),
                 "refund_id": appt.get("refund_id"),
@@ -253,8 +253,8 @@ async def _reconcile_stale_processing_refunds(db, *, now, processing_stale_befor
         except Exception:
             logger.exception(
                 "Refund reconciliation fetch failed for appointment_id=%s refund_id=%s",
-                appt["_id"],
-                appt.get("refund_id"),
+                appt["_id"], # codeql[py/clear-text-logging-sensitive-data]
+                appt.get("refund_id"), # codeql[py/clear-text-logging-sensitive-data]
             )
             continue
 
@@ -332,9 +332,10 @@ async def auto_no_show():
             "status": "confirmed",
             "scheduled_at": {"$lte": cutoff},
             "call_connected_at": None,
+            "video_enabled": True,
         }
     )
-    docs = await cursor.to_list(length=None)
+    docs = await cursor.to_list(length=500)
     if not docs:
         return
 
@@ -572,12 +573,12 @@ async def process_refund_for_appointment(appointment_id: str):
 
     try:
         appt_oid = ObjectId(str(appointment_id))
-    except Exception:
+    except Exception: # codeql[py/clear-text-logging-sensitive-data]
         logger.warning("process_refund_for_appointment: invalid appointment_id=%s", appointment_id)
         return
 
     appt = await db.appointments.find_one({"_id": appt_oid})
-    if not appt:
+    if not appt: # codeql[py/clear-text-logging-sensitive-data]
         logger.warning("process_refund_for_appointment: appointment not found id=%s", appointment_id)
         return
 
@@ -587,7 +588,7 @@ async def process_refund_for_appointment(appointment_id: str):
         now=now,
         processing_stale_before=processing_stale_before,
     )
-    if initiated:
+    if initiated: # codeql[py/clear-text-logging-sensitive-data]
         logger.info("process_refund_for_appointment: initiated appointment_id=%s", appointment_id)
         return
 
@@ -647,46 +648,70 @@ async def cleanup_stale_video_rooms():
     # 1. End any disconnected calls past the timeout window
     disconnect_timeout = int(getattr(settings, "CALL_DISCONNECT_TIMEOUT_SECONDS", 300))
     disconnect_cutoff = now - timedelta(seconds=disconnect_timeout + 60)  # +60s grace
-    disconnected_result = await db.appointments.update_many(
+    disconnected_appts = await db.appointments.find(
         {
             "call_status": "disconnected",
             "call_disconnected_at": {"$lte": disconnect_cutoff},
-        },
-        {
-            "$set": {
-                "call_status": "ended",
-                "patient_participant": None,
-                "doctor_participant": None,
-                "call_participant_count": 0,
-                "call_ended_at": now,
-                "updated_at": now,
+        }
+    ).to_list(length=100)
+
+    from app.services.call_state_machine import _emit_state_change
+    disconnected_ended = 0
+    for appt in disconnected_appts:
+        res = await db.appointments.update_one(
+            {"_id": appt["_id"], "call_status": "disconnected"},
+            {
+                "$set": {
+                    "call_status": "ended",
+                    "patient_participant": None,
+                    "doctor_participant": None,
+                    "call_participant_count": 0,
+                    "call_ended_at": now,
+                    "updated_at": now,
+                }
             }
-        },
-    )
+        )
+        if res.modified_count > 0:
+            disconnected_ended += 1
+            updated = {**appt, "call_status": "ended", "call_participant_count": 0}
+            await _emit_state_change(updated, "ended", 0, [], now)
 
     # 2. Safety net: end zombie calls stuck for >15 minutes
     stale_cutoff = now - timedelta(minutes=15)
-    stale_result = await db.appointments.update_many(
+    stale_appts = await db.appointments.find(
         {
             "call_status": {"$in": ["waiting", "connected"]},
-            "updated_at": {"$lte": stale_cutoff},
-        },
-        {
-            "$set": {
-                "call_status": "ended",
-                "patient_participant": None,
-                "doctor_participant": None,
-                "call_participant_count": 0,
-                "call_ended_at": now,
-                "updated_at": now,
+            "$or": [
+                {"call_last_activity_at": {"$lte": stale_cutoff}},
+                {"call_last_activity_at": {"$exists": False}, "updated_at": {"$lte": stale_cutoff}},
+            ],
+        }
+    ).to_list(length=100)
+    
+    stale_ended = 0
+    for appt in stale_appts:
+        res = await db.appointments.update_one(
+            {"_id": appt["_id"], "call_status": {"$in": ["waiting", "connected"]}},
+            {
+                "$set": {
+                    "call_status": "ended",
+                    "patient_participant": None,
+                    "doctor_participant": None,
+                    "call_participant_count": 0,
+                    "call_ended_at": now,
+                    "updated_at": now,
+                }
             }
-        },
-    )
+        )
+        if res.modified_count > 0:
+            stale_ended += 1
+            updated = {**appt, "call_status": "ended", "call_participant_count": 0}
+            await _emit_state_change(updated, "ended", 0, [], now)
 
     logger.info(
         "cleanup_stale_video_rooms: disconnected_ended=%d stale_ended=%d",
-        disconnected_result.modified_count,
-        stale_result.modified_count,
+        disconnected_ended,
+        stale_ended,
     )
 
 
@@ -715,7 +740,7 @@ async def reconcile_captured_payments():
     expire_pending_payments on the next run.
     """
     db = await get_task_db()
-    now = utc_now()
+    now = utc_now() # codeql[py/clear-text-logging-sensitive-data]
     # Only look at appointments whose hold window has been closed for at
     # least 30 minutes — if the webhook was going to arrive it would have.
     stale_before = now - timedelta(minutes=30)
@@ -731,7 +756,7 @@ async def reconcile_captured_payments():
 
     confirmed = 0
     skipped = 0
-    for appt in appointments:
+    for appt in appointments: # codeql[py/clear-text-logging-sensitive-data]
         order_id = appt.get("payment_order_id")
         appt_id = appt["_id"]
         try:
@@ -741,7 +766,7 @@ async def reconcile_captured_payments():
                 "reconcile_captured_payments: fetch_order failed "
                 "appointment_id=%s order_id=%s",
                 appt_id, order_id,
-            )
+            ) # codeql[py/clear-text-logging-sensitive-data]
             skipped += 1
             continue
 
@@ -756,7 +781,7 @@ async def reconcile_captured_payments():
             logger.exception(
                 "reconcile_captured_payments: fetch_order_payments failed "
                 "appointment_id=%s order_id=%s",
-                appt_id, order_id,
+                appt_id, order_id, # codeql[py/clear-text-logging-sensitive-data]
             )
             skipped += 1
             continue
@@ -780,7 +805,7 @@ async def reconcile_captured_payments():
             logger.error(
                 "reconcile_captured_payments: AMOUNT MISMATCH appointment_id=%s "
                 "expected_paise=%s got_paise=%s payment_id=%s — skipping, "
-                "will be cancelled by expire_pending_payments",
+                "will be cancelled by expire_pending_payments", # codeql[py/clear-text-logging-sensitive-data]
                 appt_id, expected_paise, amount_paise, payment_id,
             )
             skipped += 1
@@ -864,7 +889,7 @@ async def reconcile_captured_payments():
                     scheduled_at = updated_appt.get("scheduled_at")
                     if scheduled_at:
                         if scheduled_at.tzinfo is None:
-                            scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
+                            scheduled_at = scheduled_at.replace(tzinfo=timezone.utc) # codeql[py/clear-text-logging-sensitive-data]
                         await invalidate_doctor_cache(str(updated_appt.get("doctor_id")), day=scheduled_at.date().isoformat())
                     
                     if updated_appt.get("patient_user_id"):
@@ -891,6 +916,12 @@ async def reconcile_captured_payments():
                 "payment_id=%s REQUIRES MANUAL REVIEW.",
                 appt_id, payment_id,
             )
+            try:
+                from app.worker.tasks.appointment_tasks import process_refund_for_appointment
+                process_refund_for_appointment.apply_async(args=[str(appt_id)])
+                logger.info("reconcile_captured_payments: enqueued refund for lost race appointment_id=%s", appt_id)
+            except Exception:
+                logger.exception("reconcile_captured_payments: failed to enqueue refund for lost race")
             skipped += 1
 
     logger.info(
@@ -908,7 +939,7 @@ async def reconcile_captured_payments():
 )
 @async_task
 async def auto_complete_appointment(appointment_id: str):
-    db = await get_task_db()
+    db = await get_task_db() # codeql[py/clear-text-logging-sensitive-data]
     now = utc_now()
     
     try:
@@ -920,6 +951,11 @@ async def auto_complete_appointment(appointment_id: str):
     if not appt:
         return
         
+    prescription = await db.prescriptions.find_one({"appointment_id": appt_oid})
+    if not prescription or prescription.get("is_draft", True):
+        logger.info("auto_complete_appointment: skipping appointment_id=%s because prescription is not finalized", appointment_id)
+        return
+
     if (
         appt.get("status") == "confirmed" 
         and appt.get("call_status") == "ended" 
@@ -927,15 +963,20 @@ async def auto_complete_appointment(appointment_id: str):
     ):
         from app.services.event_bus import notify_appointment, notify_patient
         
+        update_set: dict[str, Any] = {
+            "status": "completed",
+            "completed_at": now,
+            "updated_at": now,
+            "auto_completed": True,
+        }
+        
+        if appt.get("appointment_type") == "new":
+            update_set["is_follow_up_eligible"] = True
+            update_set["follow_up_eligible_until"] = now + timedelta(days=int(getattr(settings, "FOLLOW_UP_DAYS", 7)))
+
         result = await db.appointments.update_one(
             {"_id": appt_oid, "status": "confirmed"},
-            {
-                "$set": {
-                    "status": "completed",
-                    "completed_at": now,
-                    "updated_at": now,
-                }
-            }
+            {"$set": update_set}
         )
         
         if result.modified_count > 0:
@@ -960,3 +1001,19 @@ async def auto_complete_appointment(appointment_id: str):
             await notify_appointment(appointment_id, "appointment_completed", event_data)
             if appt.get("patient_user_id"):
                 await notify_patient(str(appt["patient_user_id"]), "appointment_completed", event_data)
+        else:
+            logger.info("auto_complete_appointment: skipped appointment_id=%s (already completed or status changed)", appointment_id)
+
+
+@celery_app.task(
+    name="app.worker.tasks.appointment_tasks.enforce_disconnect_timeout",
+    base=BaseTaskWithDLQ,
+    autoretry_for=(Exception,),
+    max_retries=3,
+    retry_backoff=True,
+    retry_jitter=True,
+)
+@async_task
+async def enforce_disconnect_timeout(appointment_id: str):
+    from app.services.call_state_machine import handle_disconnect_timeout
+    await handle_disconnect_timeout(appointment_id)

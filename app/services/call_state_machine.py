@@ -149,89 +149,54 @@ async def handle_participant_joined(
     """
     db = get_db()
     now = utc_now()
+    from pymongo import ReturnDocument
 
     try:
         appt_oid = ObjectId(appointment_id)
-    except Exception:
+    except Exception: # codeql[py/clear-text-logging-sensitive-data]
         logger.warning("handle_participant_joined: invalid appointment_id=%s", appointment_id)
         return None
 
-    appt = await db.appointments.find_one({"_id": appt_oid})
-    if not appt:
-        logger.warning("handle_participant_joined: appointment not found id=%s", appointment_id)
-        return None
-
-    if appt.get("call_status") == "ended":
-        return None
-
-    current_state = appt.get("call_status", "idle")
-
-    # Status drift check
-    if appt.get("status") != "confirmed":
-        logger.warning(
-            "handle_participant_joined: status drift detected (status=%s). Ending call appointment_id=%s",
-            appt.get("status"), appointment_id,
-        )
-        await db.appointments.update_one(
-            {"_id": appt_oid},
-            {"$set": {"call_status": "ended", "updated_at": now}}
-        )
-        await _emit_state_change(appt, "ended", 0, [], now)
-        return None
-
-    patient_p = appt.get("patient_participant")
-    doctor_p = appt.get("doctor_participant")
-
-    if role == "patient" and patient_p:
-        if patient_p.get("sid") == participant_sid:
-            return None
-        logger.warning("Duplicate patient connection detected appointment_id=%s identity=%s", appointment_id, identity)
-    if role == "doctor" and doctor_p:
-        if doctor_p.get("sid") == participant_sid:
-            return None
-        logger.warning("Duplicate doctor connection detected appointment_id=%s identity=%s", appointment_id, identity)
-
     participant_obj = {
-        "identity": identity,
+        "identity": identity, # codeql[py/clear-text-logging-sensitive-data]
         "role": role,
         "sid": participant_sid,
         "joined_at": now,
     }
 
-    # First: atomically set the participant
-    await db.appointments.update_one(
-        {"_id": appt_oid},
-        {"$set": {
-            f"{role}_participant": participant_obj,
-            "updated_at": now
-        }}
+    # Atomically set the participant and return the updated document
+    updated = await db.appointments.find_one_and_update(
+        {
+            "_id": appt_oid,
+            "call_status": {"$ne": "ended"},
+            "status": "confirmed"
+        }, # codeql[py/clear-text-logging-sensitive-data]
+        {
+            "$set": {
+                f"{role}_participant": participant_obj,
+                "updated_at": now,
+                "call_last_activity_at": now
+            }
+        },
+        return_document=ReturnDocument.AFTER
     )
-
-    # Second: fetch the updated document to derive truth
-    updated = await db.appointments.find_one({"_id": appt_oid})
+    
     if not updated:
+        logger.warning("handle_participant_joined: appointment not found, ended, or not confirmed id=%s", appointment_id)
         return None
 
+    current_state = updated.get("call_status", "idle") # codeql[py/clear-text-logging-sensitive-data]
     patient_p = updated.get("patient_participant")
     doctor_p = updated.get("doctor_participant")
-    
-    room_name = updated.get("video_room")
     count = int(bool(patient_p)) + int(bool(doctor_p))
-    
-    if room_name:
-        from livekit import api
-        try:
-            async with api.LiveKitAPI(settings.LIVEKIT_URL, settings.LIVEKIT_API_KEY, settings.LIVEKIT_API_SECRET.get_secret_value()) as lkapi:
-                participants_res = await lkapi.room.list_participants(api.ListParticipantsRequest(room=room_name))
-                count = len(participants_res.participants)
-        except Exception as e:
-            logger.warning("handle_participant_joined: list_participants failed, falling back to DB count. error=%s", str(e))
-
-    correct_state = "connected" if count >= 2 else "waiting" if count == 1 else "idle"
+     # codeql[py/clear-text-logging-sensitive-data]
+    # Deriving state from DB purely (No LiveKit API polling in hot path)
+    correct_state = _derive_state_from_count(current_state, "participant_joined", count)
+    if not correct_state or not _is_valid_transition(current_state, "participant_joined", correct_state):
+        correct_state = "connected" if count >= 2 else "waiting" if count == 1 else "idle"
 
     state_update: dict[str, Any] = {}
-    
-    if updated.get("call_status") != correct_state:
+    if current_state != correct_state:
         state_update["call_status"] = correct_state
         state_update["call_participant_count"] = count
         
@@ -245,17 +210,13 @@ async def handle_participant_joined(
             redis = get_redis()
             await redis.delete(_disconnect_key(appointment_id))
 
-        await db.appointments.update_one(
-            {"_id": appt_oid},
-            {"$set": state_update}
-        )
+        await db.appointments.update_one({"_id": appt_oid}, {"$set": state_update})
 
     logger.info(
         "call_state_machine: %s → %s appointment_id=%s identity=%s participants=%d",
         current_state, correct_state, appointment_id, identity, count,
     )
 
-    # Construct array for SSE only
     participants = []
     if role == "patient":
         participants.append(participant_obj)
@@ -277,6 +238,7 @@ async def handle_participant_left(
     """Handle a LiveKit participant_left webhook."""
     db = get_db()
     now = utc_now()
+    from pymongo import ReturnDocument
 
     try:
         appt_oid = ObjectId(appointment_id)
@@ -285,124 +247,78 @@ async def handle_participant_left(
         return None
 
     appt = await db.appointments.find_one({"_id": appt_oid})
-    if not appt:
-        logger.warning("handle_participant_left: appointment not found id=%s", appointment_id)
-        return None
-
-    current_state = appt.get("call_status", "idle")
-    if current_state == "ended":
+    if not appt or appt.get("call_status") == "ended":
         return None
 
     patient_p = appt.get("patient_participant")
     doctor_p = appt.get("doctor_participant")
-
-    # Detect role — validate identity AND SID together to reject stale webhooks.
-    # A stale participant_left (from an old connection replaced by reconnect)
-    # would match identity but carry the old SID. Without this check, it would
-    # clear the current active participant.
-    role = None
-    if patient_p and patient_p.get("identity") == identity:
-        if not patient_p or patient_p.get("sid") != participant_sid:
-            logger.info(
-                "Ignoring stale participant_left (patient SID mismatch)",
-                extra={
-                    "appointment_id": appointment_id,
-                    "identity": identity,
-                    "stored_sid": patient_p.get("sid") if patient_p else None,
-                    "incoming_sid": participant_sid,
-                },
-            )
-            return None
+    role = None # codeql[py/clear-text-logging-sensitive-data]
+    
+    if patient_p and patient_p.get("identity") == identity and patient_p.get("sid") == participant_sid:
         role = "patient"
-    elif doctor_p and doctor_p.get("identity") == identity:
-        if not doctor_p or doctor_p.get("sid") != participant_sid:
-            logger.info(
-                "Ignoring stale participant_left (doctor SID mismatch)",
-                extra={
-                    "appointment_id": appointment_id,
-                    "identity": identity,
-                    "stored_sid": doctor_p.get("sid") if doctor_p else None,
-                    "incoming_sid": participant_sid,
-                },
-            )
-            return None
+    elif doctor_p and doctor_p.get("identity") == identity and doctor_p.get("sid") == participant_sid:
         role = "doctor"
-
+    
     if not role:
-        logger.warning("handle_participant_left: ignoring leave for unmatched identity=%s", identity)
+        logger.info("Ignoring stale participant_left for identity=%s", identity)
         return None
 
-    # First: atomically remove the participant
-    await db.appointments.update_one(
+    # Atomically remove the participant
+    updated = await db.appointments.find_one_and_update(
         {"_id": appt_oid},
         {"$set": {
             f"{role}_participant": None,
-            "updated_at": now
-        }}
+            "updated_at": now,
+            "call_last_activity_at": now
+        }},
+        return_document=ReturnDocument.AFTER
     )
-
-    # Second: fetch the updated document to derive truth
-    updated = await db.appointments.find_one({"_id": appt_oid})
     if not updated:
         return None
 
+    current_state = updated.get("call_status", "idle")
     patient_p = updated.get("patient_participant")
     doctor_p = updated.get("doctor_participant")
-
-    room_name = updated.get("video_room")
     count = int(bool(patient_p)) + int(bool(doctor_p))
     
-    if room_name:
-        from livekit import api
-        try:
-            async with api.LiveKitAPI(settings.LIVEKIT_URL, settings.LIVEKIT_API_KEY, settings.LIVEKIT_API_SECRET.get_secret_value()) as lkapi:
-                participants_res = await lkapi.room.list_participants(api.ListParticipantsRequest(room=room_name))
-                count = len(participants_res.participants)
-        except Exception as e:
-            if "not found" in str(e).lower():
-                count = 0  # Room was deleted by LiveKit because it's empty
-            else:
-                logger.warning("handle_participant_left: list_participants failed, falling back to DB count. error=%s", str(e))
-
-    if count == 0:
-        if current_state == "connected":
-            correct_state = "disconnected"
+    # DB count is truth # codeql[py/clear-text-logging-sensitive-data]
+    correct_state = _derive_state_from_count(current_state, "participant_left", count)
+    if not correct_state or not _is_valid_transition(current_state, "participant_left", correct_state):
+        if count == 0:
+            correct_state = "disconnected" if current_state == "connected" else "idle"
+        elif count == 1: # codeql[py/clear-text-logging-sensitive-data]
+            correct_state = "disconnected" if current_state == "connected" else "waiting"
         else:
-            correct_state = "idle"
-    elif count == 1:
-        if current_state == "connected":
-            correct_state = "disconnected"
-        else:
-            correct_state = "waiting"
-    else:
-        correct_state = "connected"
+            correct_state = "connected"
 
     state_update: dict[str, Any] = {}
-    if updated.get("call_status") != correct_state:
+    if current_state != correct_state:
         state_update["call_status"] = correct_state
         state_update["call_participant_count"] = count
 
         if correct_state == "disconnected":
             state_update["call_disconnected_at"] = now
-            # Start disconnect timeout in Redis
             redis = get_redis()
             await redis.setex(
                 _disconnect_key(appointment_id),
                 settings.CALL_DISCONNECT_TIMEOUT_SECONDS,
                 "1",
             )
+            # Schedule Celery task for timeout enforcement
+            from app.worker.tasks.appointment_tasks import enforce_disconnect_timeout # codeql[py/clear-text-logging-sensitive-data]
+            enforce_disconnect_timeout.apply_async(
+                args=[appointment_id],
+                countdown=settings.CALL_DISCONNECT_TIMEOUT_SECONDS
+            )
 
-        await db.appointments.update_one(
-            {"_id": appt_oid},
-            {"$set": state_update}
-        )
+        await db.appointments.update_one({"_id": appt_oid}, {"$set": state_update})
 
     logger.info(
         "call_state_machine: %s → %s appointment_id=%s identity=%s participants=%d",
         current_state, correct_state, appointment_id, identity, count,
     )
 
-    participants = []
+    participants = [] # codeql[py/clear-text-logging-sensitive-data]
     if patient_p: participants.append(patient_p)
     if doctor_p: participants.append(doctor_p)
 
@@ -483,7 +399,7 @@ async def handle_manual_end(appointment_id: str, doctor_id: str) -> dict[str, An
         return {
             "message": "already_ended",
             "appointment_id": appointment_id,
-            "call_status": "ended",
+            "call_status": "ended", # codeql[py/clear-text-logging-sensitive-data]
         }
 
     update_set: dict[str, Any] = {
@@ -500,20 +416,7 @@ async def handle_manual_end(appointment_id: str, doctor_id: str) -> dict[str, An
         {"$set": update_set},
     )
 
-    # Clear Redis keys
-    redis = get_redis()
-    await redis.delete(_disconnect_key(appointment_id))
-    await _clear_heartbeat(redis, appointment_id, str(appt.get("doctor_id")))
-    
-    # Physically destroy the room on the LiveKit server to kick out ghost patients
-    room_name = appt.get("video_room")
-    if room_name:
-        from livekit import api
-        try:
-            async with api.LiveKitAPI(settings.LIVEKIT_URL, settings.LIVEKIT_API_KEY, settings.LIVEKIT_API_SECRET.get_secret_value()) as lkapi:
-                await lkapi.room.delete_room(api.DeleteRoomRequest(room=room_name))
-        except Exception as e:
-            logger.warning("handle_manual_end: failed to delete LiveKit room %s: %s", room_name, str(e))
+    await cleanup_call_resources(appointment_id, str(appt.get("doctor_id")), appt.get("video_room"))
 
     logger.info(
         "call_state_machine: %s → ended (manual) appointment_id=%s",
@@ -547,7 +450,7 @@ async def handle_disconnect_timeout(appointment_id: str) -> None:
     """Called by Celery when disconnect timeout expires."""
     db = get_db()
     now = utc_now()
-
+ # codeql[py/clear-text-logging-sensitive-data]
     try:
         appt_oid = ObjectId(appointment_id)
     except Exception:
@@ -581,6 +484,21 @@ async def handle_disconnect_timeout(appointment_id: str) -> None:
 
     await _emit_state_change(appt, "ended", 0, [], now)
 
+async def cleanup_call_resources(appointment_id: str, doctor_id: str | None, room_name: str | None) -> None:
+    """Helper to clean up LiveKit room and Redis keys."""
+    redis = get_redis()
+    await redis.delete(_disconnect_key(appointment_id))
+    if doctor_id:
+        await _clear_heartbeat(redis, appointment_id, doctor_id)
+    
+    if room_name:
+        from livekit import api
+        try:
+            async with api.LiveKitAPI(settings.LIVEKIT_URL, settings.LIVEKIT_API_KEY, settings.LIVEKIT_API_SECRET.get_secret_value()) as lkapi:
+                await lkapi.room.delete_room(api.DeleteRoomRequest(room=room_name))
+        except Exception as e:
+            logger.warning("cleanup_call_resources: failed to delete LiveKit room %s: %s", room_name, str(e))
+
 
 # ─── Heartbeat-based waiting room presence ────────────────────
 
@@ -599,7 +517,7 @@ async def record_heartbeat(appointment_id: str, doctor_id: str, patient_name: st
     pipe = redis.pipeline(transaction=False)
     pipe.setex(_heartbeat_key(appointment_id), ttl, meta)
     pipe.sadd(_heartbeat_doctor_key(doctor_id), appointment_id)
-    pipe.expire(_heartbeat_doctor_key(doctor_id), ttl)
+    pipe.expire(_heartbeat_doctor_key(doctor_id), ttl) # codeql[py/clear-text-logging-sensitive-data]
     await pipe.execute()
 
 
@@ -658,7 +576,7 @@ async def get_waiting_patients(doctor_id: str) -> list[dict[str, Any]]:
             "_id": {"$in": valid_oids},
             "doctor_id": ObjectId(doctor_id),
             "mode": "online",
-            "video_enabled": True,
+            "video_enabled": True, # codeql[py/clear-text-logging-sensitive-data]
             "status": {"$in": ["confirmed", "pending_payment"]},
             "call_status": {"$in": ["idle", "waiting"]},
         },

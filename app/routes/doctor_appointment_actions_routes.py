@@ -2,7 +2,7 @@ import asyncio
 from datetime import timedelta
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from bson import ObjectId
 
 from app.core.config import settings
@@ -20,6 +20,7 @@ from app.services.event_bus import (
     EVENT_CALL_STATE_CHANGED,
 )
 from app.services.whatsapp_service import safe_send_whatsapp, send_patient_prescription_whatsapp
+from app.services.call_state_machine import _emit_state_change
 from app.utils.time import utc_now, ensure_utc
 
 logger = logging.getLogger(__name__)
@@ -28,7 +29,11 @@ router = APIRouter(prefix="/doctor/appointments", tags=["Doctor Appointment Acti
 
 
 @router.post("/{appointment_id}/complete")
-async def complete_appointment(appointment_id: str, doctor=Depends(get_current_doctor)):
+async def complete_appointment(
+    appointment_id: str,
+    background_tasks: BackgroundTasks,
+    doctor=Depends(get_current_doctor),
+):
     db = get_db()
 
     try:
@@ -92,30 +97,12 @@ async def complete_appointment(appointment_id: str, doctor=Depends(get_current_d
 
     if scheduled_at:
         await invalidate_doctor_cache(str(doctor["_id"]), day=scheduled_at.date().isoformat())
-    if appt.get("patient_id"):
-        await invalidate_patient_cache(str(appt["patient_id"]))
+    if appt.get("patient_user_id"):
+        await invalidate_patient_cache(str(appt["patient_user_id"]))
 
     # ─── Call Cleanup ───
-    try:
-        redis = get_redis()
-        await redis.delete(f"call:disconnected:{appointment_id}")
-        await redis.delete(f"call:heartbeat:{appointment_id}")
-        await redis.srem(f"call:heartbeat:doctor:{str(doctor['_id'])}", appointment_id)
-    except Exception as e:
-        logger.warning("complete_appointment: failed to clear Redis keys: %s", str(e))
-
-    room_name = appt.get("video_room")
-    if room_name and settings.VIDEO_ENABLED:
-        try:
-            from livekit import api
-            async with api.LiveKitAPI(
-                settings.LIVEKIT_URL,
-                settings.LIVEKIT_API_KEY,
-                settings.LIVEKIT_API_SECRET.get_secret_value()
-            ) as lkapi:
-                await lkapi.room.delete_room(api.DeleteRoomRequest(room=room_name))
-        except Exception as e:
-            logger.warning("complete_appointment: failed to delete LiveKit room %s: %s", room_name, str(e))
+    from app.services.call_state_machine import cleanup_call_resources
+    await cleanup_call_resources(appointment_id, str(doctor["_id"]), appt.get("video_room"))
 
     # SSE: notify patient and appointment channel that appointment is completed
     event_data = {
@@ -129,37 +116,22 @@ async def complete_appointment(appointment_id: str, doctor=Depends(get_current_d
         await notify_patient(str(appt["patient_user_id"]), EVENT_APPOINTMENT_COMPLETED, event_data)
 
     # Also notify call state changed to ended
-    call_event_data = {
-        "appointment_id": appointment_id,
-        "call_status": "ended",
-        "call_participant_count": 0,
-        "call_participants": [],
-        "patient_name": appt.get("patient_name"),
-        "scheduled_at": (
-            appt["scheduled_at"].isoformat() if appt.get("scheduled_at") else None
-        ),
-    }
-    await notify_doctor(str(doctor["_id"]), EVENT_CALL_STATE_CHANGED, call_event_data)
-    await notify_appointment(appointment_id, EVENT_CALL_STATE_CHANGED, call_event_data)
-    if appt.get("patient_user_id"):
-        await notify_patient(str(appt["patient_user_id"]), EVENT_CALL_STATE_CHANGED, call_event_data)
+    await _emit_state_change(appt, "ended", 0, [], now)
 
     # ── Fire prescription notifications (WhatsApp + email) in the background ──
     pdf_url = prescription.get("pdf_url") if prescription else None
     rx_id = str(prescription.get("rx_id", "RX")) if prescription else "RX"
     if pdf_url:
-        asyncio.create_task(
-            safe_send_whatsapp(
-                send_patient_prescription_whatsapp(appt, str(pdf_url), rx_id),
-                f"prescription WA appt={appointment_id}",
-            )
+        background_tasks.add_task(
+            safe_send_whatsapp,
+            send_patient_prescription_whatsapp(appt, str(pdf_url), rx_id),
+            f"prescription WA appt={appointment_id}",
         )
         if appt.get("patient_email"):
-            asyncio.create_task(
-                safe_send_email(
-                    send_prescription_email(appt, str(pdf_url), rx_id),
-                    f"prescription email appt={appointment_id}",
-                )
+            background_tasks.add_task(
+                safe_send_email,
+                send_prescription_email(appt, str(pdf_url), rx_id),
+                f"prescription email appt={appointment_id}",
             )
 
     return {
@@ -238,30 +210,12 @@ async def mark_no_show(
     scheduled_at = ensure_utc(appt.get("scheduled_at"))
     if scheduled_at:
         await invalidate_doctor_cache(str(doctor["_id"]), day=scheduled_at.date().isoformat())
-    if appt.get("patient_id"):
-        await invalidate_patient_cache(str(appt["patient_id"]))
+    if appt.get("patient_user_id"):
+        await invalidate_patient_cache(str(appt["patient_user_id"]))
 
     # ─── Call Cleanup ───
-    try:
-        redis = get_redis()
-        await redis.delete(f"call:disconnected:{appointment_id}")
-        await redis.delete(f"call:heartbeat:{appointment_id}")
-        await redis.srem(f"call:heartbeat:doctor:{str(doctor['_id'])}", appointment_id)
-    except Exception as e:
-        logger.warning("mark_no_show: failed to clear Redis keys: %s", str(e))
-
-    room_name = appt.get("video_room")
-    if room_name and settings.VIDEO_ENABLED:
-        try:
-            from livekit import api
-            async with api.LiveKitAPI(
-                settings.LIVEKIT_URL,
-                settings.LIVEKIT_API_KEY,
-                settings.LIVEKIT_API_SECRET.get_secret_value()
-            ) as lkapi:
-                await lkapi.room.delete_room(api.DeleteRoomRequest(room=room_name))
-        except Exception as e:
-            logger.warning("mark_no_show: failed to delete LiveKit room %s: %s", room_name, str(e))
+    from app.services.call_state_machine import cleanup_call_resources
+    await cleanup_call_resources(appointment_id, str(doctor["_id"]), appt.get("video_room"))
 
     # SSE: notify patient and appointment channel of no-show marking
     event_data = {
@@ -275,20 +229,7 @@ async def mark_no_show(
         await notify_patient(str(appt["patient_user_id"]), EVENT_APPOINTMENT_NO_SHOW, event_data)
 
     # Also notify call state changed to ended
-    call_event_data = {
-        "appointment_id": appointment_id,
-        "call_status": "ended",
-        "call_participant_count": 0,
-        "call_participants": [],
-        "patient_name": appt.get("patient_name"),
-        "scheduled_at": (
-            appt["scheduled_at"].isoformat() if appt.get("scheduled_at") else None
-        ),
-    }
-    await notify_doctor(str(doctor["_id"]), EVENT_CALL_STATE_CHANGED, call_event_data)
-    await notify_appointment(appointment_id, EVENT_CALL_STATE_CHANGED, call_event_data)
-    if appt.get("patient_user_id"):
-        await notify_patient(str(appt["patient_user_id"]), EVENT_CALL_STATE_CHANGED, call_event_data)
+    await _emit_state_change(appt, "ended", 0, [], now)
 
     return {
         "message": "marked_no_show",
