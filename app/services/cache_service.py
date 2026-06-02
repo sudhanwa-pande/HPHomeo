@@ -230,7 +230,7 @@ async def invalidate_doctor_cache(
     if invalidate_list:
         list_keys_bytes = await redis.smembers("doctors:tracked_list_keys")
         if list_keys_bytes:
-            list_keys = [k.decode("utf-8") for k in list_keys_bytes]
+            list_keys = [k.decode("utf-8") if isinstance(k, bytes) else k for k in list_keys_bytes]
             await cache_delete_keys(*list_keys)
             await cache_delete_keys("doctors:tracked_list_keys")
 
@@ -244,7 +244,7 @@ async def invalidate_doctor_cache(
     track_key = f"doctor:tracked_keys:{doctor_id}"
     tracked_bytes = await redis.smembers(track_key)
     if tracked_bytes:
-        tracked_keys = [k.decode("utf-8") for k in tracked_bytes]
+        tracked_keys = [k.decode("utf-8") if isinstance(k, bytes) else k for k in tracked_bytes]
         await cache_delete_keys(*tracked_keys)
         await cache_delete_keys(track_key)
 
@@ -261,7 +261,7 @@ async def invalidate_patient_cache(patient_id: str) -> None:
     track_key = f"patient:tracked_keys:{patient_id}"
     tracked_bytes = await redis.smembers(track_key)
     if tracked_bytes:
-        tracked_keys = [k.decode("utf-8") for k in tracked_bytes]
+        tracked_keys = [k.decode("utf-8") if isinstance(k, bytes) else k for k in tracked_bytes]
         await cache_delete_keys(*tracked_keys)
         await cache_delete_keys(track_key)
 

@@ -367,6 +367,8 @@ async def register(data: DoctorRegister):
             "failed_login_attempts": 0,
             "locked_until": None,
             "is_suspended": False,
+            "risk_score": data.risk_score,
+            "is_high_risk": data.risk_score >= 2,
             "created_at": now,
             "updated_at": now,
         }

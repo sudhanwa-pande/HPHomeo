@@ -2,8 +2,7 @@ import re
 from datetime import datetime
 from typing import Literal
 
-from email_validator import validate_email, EmailNotValidError
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 from app.utils.phone import normalize_phone_e164
 
@@ -25,11 +24,12 @@ def _clean_text(value: str, field_name: str) -> str:
 
 class DoctorRegister(BaseModel):
     full_name: str = Field(min_length=2, max_length=80)
-    email: EmailStr
+    email: str
     phone: str = Field(min_length=7, max_length=20)
     password: str = Field(min_length=8, max_length=128)
     registration_no: str = Field(min_length=3, max_length=50)
     turnstileToken: str | None = None
+    risk_score: int = 0
 
     @field_validator("password")
     @classmethod
@@ -51,29 +51,16 @@ class DoctorRegister(BaseModel):
     @field_validator("phone")
     @classmethod
     def validate_phone(cls, value: str) -> str:
+        from app.utils.phone import normalize_phone_e164
         return normalize_phone_e164(value)
 
-    @field_validator("email", mode="before")
-    @classmethod
-    def validate_email_strict(cls, value: str) -> str:
-        if not isinstance(value, str):
-            return value
-        try:
-            # check_deliverability=True forces a DNS MX record lookup
-            valid = validate_email(value, check_deliverability=True)
-            domain = valid.domain.lower()
-            
-            # Common disposable domains blocklist
-            disposable = {
-                "mailinator.com", "10minutemail.com", "temp-mail.org", 
-                "yopmail.com", "guerrillamail.com", "tempmail.com", "throwawaymail.com"
-            }
-            if domain in disposable:
-                raise ValueError("Disposable email addresses are not allowed")
-                
-            return valid.normalized
-        except EmailNotValidError as e:
-            raise ValueError(f"Invalid email: {str(e)}")
+    @model_validator(mode="after")
+    def validate_email_risk(self) -> "DoctorRegister":
+        from app.utils.email_validation import advanced_validate_email
+        result = advanced_validate_email(self.email)
+        self.email = result["email"]
+        self.risk_score = result["risk_score"]
+        return self
 
 
 class DoctorLogin(BaseModel):
