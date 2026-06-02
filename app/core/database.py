@@ -138,7 +138,15 @@ async def connect_db():
     )
     # Video call lifecycle queries (optional global ops)
     await _db.appointments.create_index("call_status", sparse=True)
-    await _db.appointments.create_index("video_room", unique=True, sparse=True)
+    try:
+        await _db.appointments.drop_index("video_room_1")
+    except OperationFailure:
+        pass
+    await _db.appointments.create_index(
+        "video_room",
+        unique=True,
+        partialFilterExpression={"video_room": {"$type": "string"}},
+    )
     
     # Refund lookup
     await _db.appointments.create_index(
