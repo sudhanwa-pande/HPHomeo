@@ -681,12 +681,18 @@ async def get_appointment_detail(
     }
  # codeql[py/clear-text-logging-sensitive-data]
 
+from pydantic import BaseModel
+
+class VideoTokenRequest(BaseModel):
+    recovery_reason: str | None = None
+
 @router.post(
     "/appointments/{appointment_id}/video-token",
     dependencies=[rl(settings.RL_DOCTOR_VIDEO_JOIN_TIMES, settings.RL_DOCTOR_VIDEO_JOIN_SECONDS)],
 )
 async def doctor_video_token(
-    appointment_id: str, # codeql[py/clear-text-logging-sensitive-data]
+    appointment_id: str,
+    payload: VideoTokenRequest = None,
     doctor=Depends(get_current_doctor),
 ):
     import logging
@@ -702,7 +708,7 @@ async def doctor_video_token(
     if not settings.VIDEO_ENABLED:
         raise HTTPException(status_code=503, detail="Video is disabled")
 
-    db = get_db() # codeql[py/clear-text-logging-sensitive-data]
+    db = get_db()
     now = utc_now()
 
     try:
@@ -710,10 +716,13 @@ async def doctor_video_token(
     except Exception:
         raise HTTPException(status_code=404, detail="Appointment not found")
 
+    from app.services.call_state_machine import reconcile_call_state
+    await reconcile_call_state(appointment_id)
+
     appt = await db.appointments.find_one({"_id": appt_oid, "doctor_id": doctor["_id"]})
     if not appt:
         raise HTTPException(status_code=404, detail="Appointment not found")
- # codeql[py/clear-text-logging-sensitive-data]
+
     if appt.get("mode") != "online" or not appt.get("video_enabled", False):
         raise HTTPException(status_code=403, detail="Video is not enabled for this appointment")
 
@@ -748,22 +757,63 @@ async def doctor_video_token(
     else:
         room = appt["video_room"]
 
+    # Log recovery reason if present
+    recovery_reason = payload.recovery_reason if payload else None
+    if recovery_reason:
+        logger.info(
+            "doctor_reconnecting_recovery_reason",
+            extra={"appointment_id": appointment_id, "recovery_reason": recovery_reason}
+        )
+
     # Record doctor_joined_at for analytics (does not change call state)
-    await db.appointments.update_one(
-        {"_id": appt_oid},
-        {"$set": {"doctor_joined_at": now, "doctor_last_token_issued_at": now, "updated_at": now}},
+    from pymongo import ReturnDocument
+    update_set = {
+        "doctor_last_token_issued_at": now,
+        "updated_at": now,
+    }
+    if not appt.get("doctor_joined_at"):
+        update_set["doctor_joined_at"] = now
+
+    updated_appt = await db.appointments.find_one_and_update(
+        {
+            "_id": appt_oid,
+            "call_status": {"$in": ["idle", "ended"]},
+            "session_locked": {"$ne": True}
+        },
+        {
+            "$inc": {"session_version": 1},
+            "$set": {
+                "call_status": "initializing",
+                "session_locked": True,
+                **update_set
+            }
+        },
+        return_document=ReturnDocument.AFTER
     )
+    if not updated_appt:
+        updated_appt = await db.appointments.find_one_and_update(
+            {"_id": appt_oid},
+            {"$set": update_set},
+            return_document=ReturnDocument.AFTER
+        )
+
+    session_version = updated_appt.get("session_version") if updated_appt and updated_appt.get("session_version") is not None else 0
 
     trace_id = uuid.uuid4().hex
     identity = f"doctor:{str(doctor['_id'])}"
-    logger.info("video_token_issued", extra={"appointment_id": appointment_id, "role": "doctor", "identity": identity, "trace_id": trace_id})
+    logger.info("video_token_issued", extra={"appointment_id": appointment_id, "role": "doctor", "identity": identity, "trace_id": trace_id, "session_version": session_version})
 
     try:
         join_token = create_video_token(
             room=room,
             identity=identity,
             name=doctor.get("full_name") or "Doctor",
-            metadata={"appointment_id": str(appt["_id"]), "role": "doctor", "trace_id": trace_id},
+            metadata={
+                "appointment_id": str(appt["_id"]),
+                "role": "doctor",
+                "trace_id": trace_id,
+                "session_version": session_version
+            },
             ttl_seconds=7200,
         )
     except Exception as e:
@@ -775,6 +825,37 @@ async def doctor_video_token(
         "server_url": settings.LIVEKIT_URL,
         "room": room,
         "token": join_token,
+        "session_version": session_version,
+    }
+
+
+@router.get("/appointments/{appointment_id}/reconcile")
+async def doctor_reconcile_call(
+    appointment_id: str,
+    doctor=Depends(get_current_doctor),
+):
+    """Exposes call state reconciliation to resolve potential webhook/state drift."""
+    db = get_db()
+    try:
+        appt_oid = ObjectId(appointment_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    appt = await db.appointments.find_one({"_id": appt_oid, "doctor_id": doctor["_id"]})
+    if not appt:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    from app.services.call_state_machine import reconcile_call_state
+    reconciled = await reconcile_call_state(appointment_id)
+    if not reconciled:
+        return appt
+
+    return {
+        "appointment_id": str(reconciled["_id"]),
+        "call_status": reconciled.get("call_status", "idle"),
+        "call_participant_count": reconciled.get("call_participant_count", 0),
+        "patient_participant": reconciled.get("patient_participant"),
+        "doctor_participant": reconciled.get("doctor_participant"),
     }
 
 
@@ -851,3 +932,54 @@ async def doctor_end_call(
         await invalidate_patient_cache(str(appt["patient_user_id"]))
 
     return result
+
+
+class CallHeartbeatRequest(BaseModel):
+    session_version: int | None = None
+
+@router.post("/appointments/{appointment_id}/call/heartbeat")
+async def doctor_call_heartbeat(
+    appointment_id: str,
+    payload: CallHeartbeatRequest = None,
+    doctor=Depends(get_current_doctor),
+):
+    """Periodic active call heartbeat from doctor to track presence."""
+    db = get_db()
+    now = utc_now()
+    try:
+        appt_oid = ObjectId(appointment_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    appt = await db.appointments.find_one({"_id": appt_oid, "doctor_id": doctor["_id"]})
+    if not appt:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    # Validate session version if provided
+    db_version = appt.get("session_version", 0)
+    incoming_version = payload.session_version if payload else None
+    if incoming_version is not None and incoming_version != db_version:
+        logger.warning(
+            "doctor_heartbeat_session_version_mismatch: db=%s incoming=%s appt_id=%s",
+            db_version, incoming_version, appointment_id
+        )
+        raise HTTPException(status_code=409, detail="Outdated session version")
+
+    res = await db.appointments.update_one(
+        {
+            "_id": appt_oid,
+            "doctor_id": doctor["_id"],
+            "doctor_participant": {"$ne": None}
+        },
+        {
+            "$set": {
+                "doctor_participant.last_seen": now,
+                "doctor_participant.connected": True,
+                "call_last_activity_at": now,
+                "updated_at": now
+            }
+        }
+    )
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Active call participant not found")
+    return {"status": "ok"}

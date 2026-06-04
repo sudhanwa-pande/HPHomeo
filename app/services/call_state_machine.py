@@ -21,7 +21,7 @@ All transitions are idempotent: duplicate/out-of-order webhooks are safe.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from bson import ObjectId
@@ -91,6 +91,11 @@ _VALID_TRANSITIONS: dict[tuple[str, str], set[str]] = {
     ("disconnected", "manual_end"): {"ended"},
     # timeout
     ("disconnected", "timeout"): {"ended"},
+    # initializing state transitions (token generated, waiting for join webhooks)
+    ("initializing", "participant_joined"): {"waiting", "connected"},
+    ("initializing", "participant_left"): {"idle", "waiting"},
+    ("initializing", "room_finished"): {"ended"},
+    ("initializing", "manual_end"): {"ended"},
 }
 
 
@@ -157,11 +162,20 @@ async def handle_participant_joined(
         logger.warning("handle_participant_joined: invalid appointment_id=%s", appointment_id)
         return None
 
+    appt = await db.appointments.find_one({"_id": appt_oid})
+    if appt:
+        existing_participant = appt.get(f"{role}_participant")
+        if existing_participant and existing_participant.get("sid") == participant_sid:
+            logger.info("Duplicate participant_joined webhook, skipping")
+            return appt
+
     participant_obj = {
         "identity": identity, # codeql[py/clear-text-logging-sensitive-data]
         "role": role,
         "sid": participant_sid,
         "joined_at": now,
+        "last_seen": now,
+        "connected": True,
     }
 
     # Atomically set the participant and return the updated document
@@ -199,6 +213,8 @@ async def handle_participant_joined(
     if current_state != correct_state:
         state_update["call_status"] = correct_state
         state_update["call_participant_count"] = count
+        if correct_state in ("idle", "ended"):
+            state_update["session_locked"] = False
         
         # Set call_connected_at on first connection
         if correct_state == "connected" and not updated.get("call_connected_at"):
@@ -254,13 +270,27 @@ async def handle_participant_left(
     doctor_p = appt.get("doctor_participant")
     role = None # codeql[py/clear-text-logging-sensitive-data]
     
-    if patient_p and patient_p.get("identity") == identity and patient_p.get("sid") == participant_sid:
+    if patient_p and patient_p.get("identity") == identity:
+        stored_sid = patient_p.get("sid")
+        if stored_sid != participant_sid:
+            logger.warning(
+                "participant_left for stale SID: stored=%s received=%s role=patient identity=%s",
+                stored_sid, participant_sid, identity
+            )
+            return None
         role = "patient"
-    elif doctor_p and doctor_p.get("identity") == identity and doctor_p.get("sid") == participant_sid:
+    elif doctor_p and doctor_p.get("identity") == identity:
+        stored_sid = doctor_p.get("sid")
+        if stored_sid != participant_sid:
+            logger.warning(
+                "participant_left for stale SID: stored=%s received=%s role=doctor identity=%s",
+                stored_sid, participant_sid, identity
+            )
+            return None
         role = "doctor"
     
     if not role:
-        logger.info("Ignoring stale participant_left for identity=%s", identity)
+        logger.info("Ignoring stale participant_left for identity=%s sid=%s", identity, participant_sid)
         return None
 
     # Atomically remove the participant
@@ -295,6 +325,8 @@ async def handle_participant_left(
     if current_state != correct_state:
         state_update["call_status"] = correct_state
         state_update["call_participant_count"] = count
+        if correct_state in ("idle", "ended"):
+            state_update["session_locked"] = False
 
         if correct_state == "disconnected":
             state_update["call_disconnected_at"] = now
@@ -345,6 +377,7 @@ async def handle_room_finished(room_name: str) -> None:
 
     update_set: dict[str, Any] = {
         "call_status": "ended",
+        "session_locked": False,
         "patient_participant": None,
         "doctor_participant": None,
         "call_participant_count": 0,
@@ -380,6 +413,136 @@ async def handle_room_finished(room_name: str) -> None:
         )
 
 
+async def reconcile_call_state(appointment_id: str) -> dict[str, Any] | None:
+    """Reconcile the call state in DB with the actual state in LiveKit."""
+    from livekit import api
+    db = get_db()
+    try:
+        appt_oid = ObjectId(appointment_id)
+    except Exception:
+        return None
+
+    appt = await db.appointments.find_one({"_id": appt_oid})
+    if not appt or appt.get("call_status") == "ended":
+        return appt
+
+    # Cooldown check to prevent spamming LiveKit API
+    redis = get_redis()
+    cooldown_key = f"call:reconcile:cooldown:{appointment_id}"
+    if await redis.get(cooldown_key):
+        logger.info("reconcile_call_state: skipping due to cooldown for appointment_id=%s", appointment_id)
+        return appt
+
+    room_name = appt.get("video_room")
+    if not room_name or not settings.VIDEO_ENABLED:
+        return appt
+
+    try:
+        async with api.LiveKitAPI(
+            settings.LIVEKIT_URL,
+            settings.LIVEKIT_API_KEY,
+            settings.LIVEKIT_API_SECRET.get_secret_value()
+        ) as lkapi:
+            # Fetch participants in LiveKit room
+            res = await lkapi.room.list_participants(api.ListParticipantsRequest(room=room_name))
+            lk_participants = res.participants
+            # Set reconciliation cooldown
+            await redis.setex(cooldown_key, 10, "1")
+    except Exception as e:
+        logger.warning("reconcile_call_state: failed to list participants for room %s: %s", room_name, str(e))
+        return appt
+
+    # Check if there is a mismatch
+    lk_identities = {p.identity for p in lk_participants}
+    
+    patient_p = appt.get("patient_participant")
+    doctor_p = appt.get("doctor_participant")
+    
+    db_identities = set()
+    if patient_p:
+        db_identities.add(patient_p.get("identity"))
+    if doctor_p:
+        db_identities.add(doctor_p.get("identity"))
+
+    if lk_identities != db_identities:
+        logger.info(
+            "reconcile_call_state: mismatch detected for appointment_id=%s. DB=%s, LiveKit=%s",
+            appointment_id, db_identities, lk_identities
+        )
+        
+        # Build corrected participant objects
+        new_patient_p = None
+        new_doctor_p = None
+        
+        # Sort by joined_at ascending so that in case of duplicates, the latest participant wins
+        sorted_participants = sorted(lk_participants, key=lambda x: x.joined_at or 0)
+        for p in sorted_participants:
+            role = None
+            if p.identity.startswith("doctor:"):
+                role = "doctor"
+            elif p.identity.startswith("patient:") or p.identity.startswith("public:"):
+                role = "patient"
+                
+            p_obj = {
+                "identity": p.identity,
+                "role": role or "patient",
+                "sid": p.sid,
+                "joined_at": datetime.fromtimestamp(p.joined_at, tz=timezone.utc) if p.joined_at else utc_now(),
+                "last_seen": utc_now(),
+                "connected": True,
+            }
+            if role == "doctor":
+                new_doctor_p = p_obj
+            else:
+                new_patient_p = p_obj
+                
+        now = utc_now()
+        count = int(bool(new_patient_p)) + int(bool(new_doctor_p))
+        
+        current_state = appt.get("call_status", "idle")
+        correct_state = "connected" if count >= 2 else "waiting" if count == 1 else "idle"
+        
+        state_update = {
+            "patient_participant": new_patient_p,
+            "doctor_participant": new_doctor_p,
+            "call_participant_count": count,
+            "updated_at": now,
+            "call_last_activity_at": now,
+        }
+        
+        if current_state != correct_state:
+            state_update["call_status"] = correct_state
+            if correct_state in ("idle", "ended"):
+                state_update["session_locked"] = False
+            if correct_state == "connected" and not appt.get("call_connected_at"):
+                state_update["call_connected_at"] = now
+            if current_state == "disconnected" and correct_state in ("waiting", "connected"):
+                state_update["call_disconnected_at"] = None
+                redis = get_redis()
+                await redis.delete(_disconnect_key(appointment_id))
+                
+        logger.info(
+            "reconcile_call_state: corrected state for appointment_id=%s. Old state=%s, new state=%s, count=%d",
+            appointment_id, current_state, correct_state, count
+        )
+        try:
+            redis = get_redis()
+            await redis.incr("call:reconcile:corrections_count")
+        except Exception as e:
+            logger.warning("failed to increment reconcile corrections counter: %s", str(e))
+        await db.appointments.update_one({"_id": appt_oid}, {"$set": state_update})
+        
+        # Emit event to notify SSE clients of state change
+        updated_appt = {**appt, **state_update}
+        participants = []
+        if new_patient_p: participants.append(new_patient_p)
+        if new_doctor_p: participants.append(new_doctor_p)
+        await _emit_state_change(updated_appt, correct_state, count, participants, now)
+        return updated_appt
+
+    return appt
+
+
 async def handle_manual_end(appointment_id: str, doctor_id: str) -> dict[str, Any]:
     """Doctor manually ends the call."""
     db = get_db()
@@ -404,6 +567,7 @@ async def handle_manual_end(appointment_id: str, doctor_id: str) -> dict[str, An
 
     update_set: dict[str, Any] = {
         "call_status": "ended",
+        "session_locked": False,
         "patient_participant": None,
         "doctor_participant": None,
         "call_participant_count": 0,
@@ -461,6 +625,7 @@ async def handle_disconnect_timeout(appointment_id: str) -> None:
         {
             "$set": {
                 "call_status": "ended",
+                "session_locked": False,
                 "patient_participant": None,
                 "doctor_participant": None,
                 "call_participant_count": 0,
@@ -776,3 +941,88 @@ async def _emit_state_change(
     await notify_appointment(appointment_id, EVENT_CALL_STATE_CHANGED, event_data)
     if patient_user_id:
         await notify_patient(str(patient_user_id), EVENT_CALL_STATE_CHANGED, event_data)
+
+
+async def handle_participant_timeout(appointment_id: str, role: str) -> dict[str, Any] | None:
+    """Handle a participant timeout (heartbeat stopped)."""
+    db = get_db()
+    now = utc_now()
+    from pymongo import ReturnDocument
+
+    try:
+        appt_oid = ObjectId(appointment_id)
+    except Exception:
+        return None
+
+    # Check if participant is still registered and connected
+    appt = await db.appointments.find_one({"_id": appt_oid})
+    if not appt or appt.get("call_status") == "ended":
+        return None
+
+    participant = appt.get(f"{role}_participant")
+    if not participant or not participant.get("connected"):
+        return None
+
+    logger.info("call_state_machine: participant timeout role=%s appointment_id=%s", role, appointment_id)
+
+    # Mark participant as disconnected
+    updated = await db.appointments.find_one_and_update(
+        {"_id": appt_oid},
+        {
+            "$set": {
+                f"{role}_participant.connected": False,
+                "updated_at": now,
+                "call_last_activity_at": now
+            }
+        },
+        return_document=ReturnDocument.AFTER
+    )
+    if not updated:
+        return None
+
+    # Recompute call status
+    current_state = updated.get("call_status", "idle")
+    patient_p = updated.get("patient_participant")
+    doctor_p = updated.get("doctor_participant")
+    
+    patient_alive = patient_p and patient_p.get("connected")
+    doctor_alive = doctor_p and doctor_p.get("connected")
+    
+    count = int(bool(patient_alive)) + int(bool(doctor_alive))
+    
+    if patient_alive and doctor_alive:
+        correct_state = "connected"
+    elif patient_alive or doctor_alive:
+        correct_state = "waiting"
+    else:
+        correct_state = "disconnected"
+
+    state_update: dict[str, Any] = {}
+    if current_state != correct_state:
+        state_update["call_status"] = correct_state
+        state_update["call_participant_count"] = count
+
+        if correct_state == "disconnected":
+            state_update["call_disconnected_at"] = now
+            redis = get_redis()
+            await redis.setex(
+                _disconnect_key(appointment_id),
+                settings.CALL_DISCONNECT_TIMEOUT_SECONDS,
+                "1",
+            )
+            # Schedule Celery task for timeout enforcement
+            from app.worker.tasks.appointment_tasks import enforce_disconnect_timeout
+            enforce_disconnect_timeout.apply_async(
+                args=[appointment_id],
+                countdown=settings.CALL_DISCONNECT_TIMEOUT_SECONDS
+            )
+
+        await db.appointments.update_one({"_id": appt_oid}, {"$set": state_update})
+
+    # Emit event to notify SSE clients of state change
+    final_appt = {**updated, **state_update}
+    participants = []
+    if patient_p and patient_alive: participants.append(patient_p)
+    if doctor_p and doctor_alive: participants.append(doctor_p)
+    await _emit_state_change(final_appt, correct_state, count, participants, now)
+    return final_appt

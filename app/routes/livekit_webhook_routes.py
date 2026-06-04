@@ -173,7 +173,7 @@ async def livekit_webhook(request: Request, background_tasks: BackgroundTasks):
 
         role = _extract_role_from_identity(identity)
         logger.info("participant_joined webhook: appointment_id=%s role=%s trace_id=%s", appointment_id, role, trace_id)
-        background_tasks.add_task(handle_participant_joined, appointment_id, identity, role, participant_sid)
+        await handle_participant_joined(appointment_id, identity, role, participant_sid)
         return {"status": "ok"}
 
     elif event == "participant_left":
@@ -183,7 +183,7 @@ async def livekit_webhook(request: Request, background_tasks: BackgroundTasks):
 
         role = _extract_role_from_identity(identity)
         logger.info("participant_left webhook: appointment_id=%s role=%s trace_id=%s", appointment_id, role, trace_id)
-        background_tasks.add_task(handle_participant_left, appointment_id, identity, participant_sid)
+        await handle_participant_left(appointment_id, identity, participant_sid)
         return {"status": "ok"}
 
     elif event == "room_finished":
@@ -191,7 +191,7 @@ async def livekit_webhook(request: Request, background_tasks: BackgroundTasks):
             return {"status": "ignored"}
 
         logger.info("room_finished webhook: room=%s appointment_id=%s trace_id=%s", room_name, appointment_id, trace_id)
-        background_tasks.add_task(handle_room_finished, room_name)
+        await handle_room_finished(room_name)
         return {"status": "ok"}
 
     else:

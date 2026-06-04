@@ -350,6 +350,7 @@ async def auto_no_show():
                 "$set": {
                     "status": "no_show",
                     "call_status": "ended",
+                    "session_locked": False,
                     "no_show_at": now,
                     "updated_at": now,
                 }
@@ -663,6 +664,7 @@ async def cleanup_stale_video_rooms():
             {
                 "$set": {
                     "call_status": "ended",
+                    "session_locked": False,
                     "patient_participant": None,
                     "doctor_participant": None,
                     "call_participant_count": 0,
@@ -695,6 +697,7 @@ async def cleanup_stale_video_rooms():
             {
                 "$set": {
                     "call_status": "ended",
+                    "session_locked": False,
                     "patient_participant": None,
                     "doctor_participant": None,
                     "call_participant_count": 0,
@@ -1017,3 +1020,80 @@ async def auto_complete_appointment(appointment_id: str):
 async def enforce_disconnect_timeout(appointment_id: str):
     from app.services.call_state_machine import handle_disconnect_timeout
     await handle_disconnect_timeout(appointment_id)
+
+
+@celery_app.task(
+    name="app.worker.tasks.appointment_tasks.check_call_timeouts",
+    base=BaseTaskWithDLQ,
+    autoretry_for=(Exception,),
+    max_retries=3,
+    retry_backoff=True,
+    retry_jitter=True,
+)
+@async_task
+async def check_call_timeouts():
+    db = await get_task_db()
+    now = utc_now()
+    cutoff = now - timedelta(seconds=20)
+
+    # Find active calls where either participant was last seen before cutoff
+    cursor = db.appointments.find({
+        "call_status": {"$in": ["waiting", "connected"]},
+        "$or": [
+            {
+                "doctor_participant": {"$ne": None},
+                "doctor_participant.connected": True,
+                "doctor_participant.last_seen": {"$lt": cutoff}
+            },
+            {
+                "patient_participant": {"$ne": None},
+                "patient_participant.connected": True,
+                "patient_participant.last_seen": {"$lt": cutoff}
+            }
+        ]
+    })
+    
+    appointments = await cursor.to_list(length=100)
+    if not appointments:
+        return
+
+    from app.services.call_state_machine import handle_participant_timeout
+    for appt in appointments:
+        for role in ["doctor", "patient"]:
+            participant = appt.get(f"{role}_participant")
+            if participant and participant.get("connected"):
+                last_seen = participant.get("last_seen")
+                joined_at = participant.get("joined_at") or appt.get("updated_at")
+                check_time = last_seen or joined_at
+                
+                from app.utils.time import ensure_utc
+                check_time = ensure_utc(check_time)
+                
+                if check_time < cutoff:
+                    logger.info("check_call_timeouts: participant timeout role=%s appointment_id=%s last_seen=%s", role, appt["_id"], check_time)
+                    await handle_participant_timeout(str(appt["_id"]), role)
+
+
+@celery_app.task(
+    name="app.worker.tasks.appointment_tasks.reconcile_active_calls",
+    base=BaseTaskWithDLQ,
+    autoretry_for=(Exception,),
+    max_retries=3,
+    retry_backoff=True,
+    retry_jitter=True,
+)
+@async_task
+async def reconcile_active_calls():
+    """Periodically reconcile active calls to ensure DB states match LiveKit reality."""
+    db = await get_task_db()
+    cursor = db.appointments.find({
+        "call_status": {"$in": ["waiting", "connected"]}
+    })
+    
+    appointments = await cursor.to_list(length=100)
+    if not appointments:
+        return
+
+    from app.services.call_state_machine import reconcile_call_state
+    for appt in appointments:
+        await reconcile_call_state(str(appt["_id"]))

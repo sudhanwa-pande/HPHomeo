@@ -255,12 +255,18 @@ async def public_verify_payment(
     )
 
 
+from pydantic import BaseModel
+
+class VideoTokenRequest(BaseModel):
+    recovery_reason: str | None = None
+
 @router.post(
     "/appointments/{appointment_id}/video-token",
     dependencies=[rl(settings.RL_PUBLIC_VIDEO_JOIN_TIMES, settings.RL_PUBLIC_VIDEO_JOIN_SECONDS)],
 )
 async def public_video_token(
     appointment_id: str,
+    payload: VideoTokenRequest = None,
     token: str = Depends(get_patient_access_token),
 ):
     import logging
@@ -284,6 +290,9 @@ async def public_video_token(
         appt_oid = ObjectId(appointment_id)
     except Exception:
         raise HTTPException(status_code=404, detail="Appointment not found")
+
+    from app.services.call_state_machine import reconcile_call_state
+    await reconcile_call_state(appointment_id)
 
     appt = await db.appointments.find_one({"_id": appt_oid})
     if not appt:
@@ -324,23 +333,64 @@ async def public_video_token(
     else:
         room = appt["video_room"]
 
+    # Log recovery reason if present
+    recovery_reason = payload.recovery_reason if payload else None
+    if recovery_reason:
+        logger.info(
+            "public_patient_reconnecting_recovery_reason",
+            extra={"appointment_id": appointment_id, "recovery_reason": recovery_reason}
+        )
+
     # Record patient_joined_at for analytics only — does NOT change call state.
     # State transitions happen only via LiveKit webhooks when participants actually join.
-    await db.appointments.update_one(
-        {"_id": appt_oid},
-        {"$set": {"patient_joined_at": now, "patient_last_token_issued_at": now, "updated_at": now}},
+    from pymongo import ReturnDocument
+    update_set = {
+        "patient_last_token_issued_at": now,
+        "updated_at": now,
+    }
+    if not appt.get("patient_joined_at"):
+        update_set["patient_joined_at"] = now
+
+    updated_appt = await db.appointments.find_one_and_update(
+        {
+            "_id": appt_oid,
+            "call_status": {"$in": ["idle", "ended"]},
+            "session_locked": {"$ne": True}
+        },
+        {
+            "$inc": {"session_version": 1},
+            "$set": {
+                "call_status": "initializing",
+                "session_locked": True,
+                **update_set
+            }
+        },
+        return_document=ReturnDocument.AFTER
     )
+    if not updated_appt:
+        updated_appt = await db.appointments.find_one_and_update(
+            {"_id": appt_oid},
+            {"$set": update_set},
+            return_document=ReturnDocument.AFTER
+        )
+
+    session_version = updated_appt.get("session_version") if updated_appt and updated_appt.get("session_version") is not None else 0
 
     trace_id = uuid.uuid4().hex
     identity = f"patient:{appointment_id}"
-    logger.info("video_token_issued", extra={"appointment_id": appointment_id, "role": "patient", "identity": identity, "trace_id": trace_id, "public": True}) # codeql[py/clear-text-logging-sensitive-data]
+    logger.info("video_token_issued", extra={"appointment_id": appointment_id, "role": "patient", "identity": identity, "trace_id": trace_id, "session_version": session_version, "public": True}) # codeql[py/clear-text-logging-sensitive-data]
 
     try:
         join_token = create_video_token(
             room=room,
             identity=identity,
             name=appt.get("patient_name") or "Patient",
-            metadata={"appointment_id": appointment_id, "role": "patient", "trace_id": trace_id},
+            metadata={
+                "appointment_id": appointment_id,
+                "role": "patient",
+                "trace_id": trace_id,
+                "session_version": session_version
+            },
             ttl_seconds=7200,
         )
     except Exception as e:
@@ -352,7 +402,93 @@ async def public_video_token(
         "server_url": settings.LIVEKIT_URL,
         "room": room,
         "token": join_token,
+        "session_version": session_version,
     }
+
+
+@router.get("/appointments/{appointment_id}/reconcile")
+async def public_reconcile_call(
+    appointment_id: str,
+    token: str = Depends(get_patient_access_token),
+):
+    """Exposes call state reconciliation to resolve potential webhook/state drift."""
+    db = get_db()
+    try:
+        appt_oid = ObjectId(appointment_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    appt = await db.appointments.find_one({"_id": appt_oid})
+    if not appt:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    now = utc_now()
+    validate_patient_token(appt, token, now)
+
+    from app.services.call_state_machine import reconcile_call_state
+    reconciled = await reconcile_call_state(appointment_id)
+    if not reconciled:
+        return appt
+
+    return {
+        "appointment_id": str(reconciled["_id"]),
+        "call_status": reconciled.get("call_status", "idle"),
+        "call_participant_count": reconciled.get("call_participant_count", 0),
+        "patient_participant": reconciled.get("patient_participant"),
+        "doctor_participant": reconciled.get("doctor_participant"),
+    }
+
+
+class CallHeartbeatRequest(BaseModel):
+    session_version: int | None = None
+
+@router.post("/appointments/{appointment_id}/call/heartbeat")
+async def public_call_heartbeat(
+    appointment_id: str,
+    payload: CallHeartbeatRequest = None,
+    token: str = Depends(get_patient_access_token),
+):
+    """Periodic active call heartbeat from public patient to track presence."""
+    db = get_db()
+    now = utc_now()
+    try:
+        appt_oid = ObjectId(appointment_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    appt = await db.appointments.find_one({"_id": appt_oid})
+    if not appt:
+        raise HTTPException(status_code=404, detail="Appointment not found")
+
+    validate_patient_token(appt, token, now)
+
+    # Validate session version if provided
+    db_version = appt.get("session_version", 0)
+    incoming_version = payload.session_version if payload else None
+    if incoming_version is not None and incoming_version != db_version:
+        logger.warning(
+            "public_heartbeat_session_version_mismatch: db=%s incoming=%s appt_id=%s",
+            db_version, incoming_version, appointment_id
+        )
+        raise HTTPException(status_code=409, detail="Outdated session version")
+
+    res = await db.appointments.update_one(
+        {
+            "_id": appt_oid,
+            "patient_participant": {"$ne": None}
+        },
+        {
+            "$set": {
+                "patient_participant.last_seen": now,
+                "patient_participant.connected": True,
+                "call_last_activity_at": now,
+                "updated_at": now
+            }
+        }
+    )
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Active call participant not found")
+    return {"status": "ok"}
 
 
 @router.post(

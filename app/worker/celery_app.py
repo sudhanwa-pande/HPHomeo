@@ -146,5 +146,13 @@ celery_app.conf.beat_schedule = {
     "write-beat-heartbeat": {
         "task": "app.worker.tasks.cache_tasks.write_beat_heartbeat",
         "schedule": 300.0,
+    },
+    "check-call-timeouts": {
+        "task": "app.worker.tasks.appointment_tasks.check_call_timeouts",
+        "schedule": 10.0,
+    },
+    "reconcile-active-calls": {
+        "task": "app.worker.tasks.appointment_tasks.reconcile_active_calls",
+        "schedule": 30.0,
     }
 }
