@@ -29,6 +29,7 @@ from bson import ObjectId
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.redis import get_redis
+from app.utils.redis_utils import SafeRedis, RedisKeys
 from app.services.event_bus import (
     notify_appointment,
     notify_doctor,
@@ -46,24 +47,17 @@ CALL_STATES = ("idle", "waiting", "connected", "disconnected", "ended")
 EVENT_CALL_STATE_CHANGED = "call_state_changed"
 
 # Redis keys for disconnect timeout tracking
-_DISCONNECT_KEY_PREFIX = "call:disconnected:"
-
-
 def _disconnect_key(appointment_id: str) -> str:
-    return f"{_DISCONNECT_KEY_PREFIX}{appointment_id}"
+    return RedisKeys.disconnect_key(appointment_id)
 
 
 # Redis keys for heartbeat-based waiting room presence
-_HEARTBEAT_KEY_PREFIX = "call:heartbeat:"
-_HEARTBEAT_DOCTOR_PREFIX = "call:heartbeat:doctor:"
-
-
 def _heartbeat_key(appointment_id: str) -> str:
-    return f"{_HEARTBEAT_KEY_PREFIX}{appointment_id}"
+    return RedisKeys.heartbeat_key(appointment_id)
 
 
 def _heartbeat_doctor_key(doctor_id: str) -> str:
-    return f"{_HEARTBEAT_DOCTOR_PREFIX}{doctor_id}"
+    return RedisKeys.heartbeat_doctor_key(doctor_id)
 
 
 # ─── Allowed transitions ─────────────────────────────────────
@@ -226,6 +220,10 @@ async def handle_participant_joined(
             redis = get_redis()
             await redis.delete(_disconnect_key(appointment_id))
 
+        redis = get_redis()
+        if correct_state in ("waiting", "connected"):
+            await transition_call_redis_state(redis, appointment_id, "active")
+
         await db.appointments.update_one({"_id": appt_oid}, {"$set": state_update})
 
     logger.info(
@@ -343,6 +341,10 @@ async def handle_participant_left(
                 countdown=settings.CALL_DISCONNECT_TIMEOUT_SECONDS
             )
 
+        redis = get_redis()
+        if correct_state == "disconnected":
+            await transition_call_redis_state(redis, appointment_id, "ending")
+
         await db.appointments.update_one({"_id": appt_oid}, {"$set": state_update})
 
     logger.info(
@@ -387,7 +389,10 @@ async def handle_room_finished(room_name: str) -> None:
 
     result = await db.appointments.update_one(
         {"_id": appt["_id"], "call_status": {"$nin": ["ended", "idle"]}},
-        {"$set": update_set},
+        {
+            "$set": update_set,
+            "$inc": {"session_version": 1}
+        },
     )
 
     if result.modified_count == 0:
@@ -396,6 +401,8 @@ async def handle_room_finished(room_name: str) -> None:
     # Clear any disconnect timeout
     redis = get_redis()
     await redis.delete(_disconnect_key(appointment_id))
+    await redis.delete(RedisKeys.call_version(appointment_id))
+    await transition_call_redis_state(redis, appointment_id, "ended")
 
     logger.info(
         "call_state_machine: %s → ended (room_finished) appointment_id=%s room=%s",
@@ -427,8 +434,12 @@ async def reconcile_call_state(appointment_id: str) -> dict[str, Any] | None:
         return appt
 
     # Cooldown check to prevent spamming LiveKit API
-    redis = get_redis()
-    cooldown_key = f"call:reconcile:cooldown:{appointment_id}"
+    redis = SafeRedis(get_redis())
+    room_name = appt.get("video_room")
+    if not room_name or not settings.VIDEO_ENABLED:
+        return appt
+
+    cooldown_key = RedisKeys.reconcile_cooldown(appointment_id)
     if await redis.get(cooldown_key):
         logger.info("reconcile_call_state: skipping due to cooldown for appointment_id=%s", appointment_id)
         return appt
@@ -463,6 +474,32 @@ async def reconcile_call_state(appointment_id: str) -> dict[str, Any] | None:
         db_identities.add(patient_p.get("identity"))
     if doctor_p:
         db_identities.add(doctor_p.get("identity"))
+
+    current_state = appt.get("call_status", "idle")
+
+    # Handle stale "initializing" state: a token was generated (setting
+    # call_status="initializing" and session_locked=True) but the participant
+    # never actually joined the LiveKit room (e.g. user pressed back, page
+    # refreshed). Without this check the lock is held forever, blocking
+    # all subsequent join attempts.
+    if current_state == "initializing" and len(lk_participants) == 0:
+        now = utc_now()
+        updated_at = ensure_utc(appt.get("updated_at") or now)
+        if (now - updated_at).total_seconds() > 30:
+            stale_update = {
+                "call_status": "idle",
+                "session_locked": False,
+                "patient_participant": None,
+                "doctor_participant": None,
+                "call_participant_count": 0,
+                "updated_at": now,
+            }
+            await db.appointments.update_one({"_id": appt_oid}, {"$set": stale_update})
+            logger.info(
+                "reconcile_call_state: cleared stale 'initializing' state for appointment_id=%s",
+                appointment_id,
+            )
+            return {**appt, **stale_update}
 
     if lk_identities != db_identities:
         logger.info(
@@ -499,7 +536,6 @@ async def reconcile_call_state(appointment_id: str) -> dict[str, Any] | None:
         now = utc_now()
         count = int(bool(new_patient_p)) + int(bool(new_doctor_p))
         
-        current_state = appt.get("call_status", "idle")
         correct_state = "connected" if count >= 2 else "waiting" if count == 1 else "idle"
         
         state_update = {
@@ -577,7 +613,10 @@ async def handle_manual_end(appointment_id: str, doctor_id: str) -> dict[str, An
 
     await db.appointments.update_one(
         {"_id": appt_oid, "doctor_id": ObjectId(doctor_id)},
-        {"$set": update_set},
+        {
+            "$set": update_set,
+            "$inc": {"session_version": 1}
+        },
     )
 
     await cleanup_call_resources(appointment_id, str(appt.get("doctor_id")), appt.get("video_room"))
@@ -631,7 +670,8 @@ async def handle_disconnect_timeout(appointment_id: str) -> None:
                 "call_participant_count": 0,
                 "call_ended_at": now,
                 "updated_at": now,
-            }
+            },
+            "$inc": {"session_version": 1}
         },
     )
 
@@ -653,6 +693,7 @@ async def cleanup_call_resources(appointment_id: str, doctor_id: str | None, roo
     """Helper to clean up LiveKit room and Redis keys."""
     redis = get_redis()
     await redis.delete(_disconnect_key(appointment_id))
+    await redis.delete(RedisKeys.call_version(appointment_id))
     if doctor_id:
         await _clear_heartbeat(redis, appointment_id, doctor_id)
     
@@ -696,11 +737,11 @@ async def get_waiting_patients(doctor_id: str) -> list[dict[str, Any]]:
     """Get patients in the waiting room (heartbeat-based pre-call presence)."""
     import json
 
-    redis = get_redis()
+    safe_redis = SafeRedis(redis)
     db = get_db()
 
     # Get appointment IDs from doctor's heartbeat set
-    appt_ids = await redis.smembers(_heartbeat_doctor_key(doctor_id))
+    appt_ids = await safe_redis.smembers_str(_heartbeat_doctor_key(doctor_id))
     if not appt_ids:
         return []
 
@@ -755,7 +796,7 @@ async def get_waiting_patients(doctor_id: str) -> list[dict[str, Any]]:
 
     results = []
     for doc in docs:
-        hb_raw = await redis.get(_heartbeat_key(str(doc["_id"])))
+        hb_raw = await safe_redis.get_str(_heartbeat_key(str(doc["_id"])))
         meta = {}
         if hb_raw:
             try:
@@ -1017,6 +1058,10 @@ async def handle_participant_timeout(appointment_id: str, role: str) -> dict[str
                 countdown=settings.CALL_DISCONNECT_TIMEOUT_SECONDS
             )
 
+        redis = get_redis()
+        if correct_state == "disconnected":
+            await transition_call_redis_state(redis, appointment_id, "ending")
+
         await db.appointments.update_one({"_id": appt_oid}, {"$set": state_update})
 
     # Emit event to notify SSE clients of state change
@@ -1026,3 +1071,147 @@ async def handle_participant_timeout(appointment_id: str, role: str) -> dict[str
     if doctor_p and doctor_alive: participants.append(doctor_p)
     await _emit_state_change(final_appt, correct_state, count, participants, now)
     return final_appt
+
+
+# ─── Final Safety and Telemetry Helpers ───────────────────────
+
+async def transition_call_redis_state(redis, appointment_id: str, next_state: str) -> bool:
+    """Validate and transition call state in Redis to ensure Mongo/Redis consistency."""
+    safe_redis = SafeRedis(redis)
+    key = RedisKeys.call_state(appointment_id)
+    allowed_transitions = {
+        "idle": {"connecting"},
+        "connecting": {"active", "ended"},
+        "active": {"ending", "ended"},
+        "ending": {"ended"},
+        "ended": set()
+    }
+    try:
+        curr_state_str = await safe_redis.hget_str(key, "state")
+        if not curr_state_str:
+            curr_state_str = "idle"
+            
+        if curr_state_str == next_state:
+            return True
+            
+        allowed = allowed_transitions.get(curr_state_str, set())
+        if next_state not in allowed:
+            logger.warning("Redis FSM: Invalid transition from %s to %s for appointment %s", curr_state_str, next_state, appointment_id)
+            return False
+            
+        version = await redis.hincrby(key, "version", 1)
+        await redis.hset(key, mapping={"state": next_state, "version": str(version)})
+        await redis.expire(key, 7200) # 2 hours TTL
+        logger.info("Redis FSM: Transitioned %s → %s (v%d) for appointment %s", curr_state_str, next_state, version, appointment_id)
+        return True
+    except Exception as exc:
+        logger.warning("Redis FSM: Error transitioning state to %s for appointment %s: %s", next_state, appointment_id, str(exc))
+        return False
+
+
+async def log_call_timeline(redis, appointment_id: str, event: str, session_id: str | None = None, epoch: int | None = None, strategy: str | None = None, rtt: float | None = None, packet_loss: float | None = None):
+    """Log an operational event to a capped timeline list in Redis."""
+    try:
+        import time
+        import json
+        log_entry = {
+            "ts": time.time(),
+            "event": event,
+            "session_id": session_id,
+            "epoch": epoch,
+            "strategy": strategy,
+            "rtt": rtt,
+            "packet_loss": packet_loss
+        }
+        log_key = f"call_log:{appointment_id}"
+        await redis.lpush(log_key, json.dumps(log_entry))
+        await redis.ltrim(log_key, 0, 199) # Limit to 200 entries
+        await redis.expire(log_key, 7200)
+    except Exception as exc:
+        logger.warning("Observability: Failed to log call timeline: %s", str(exc))
+
+
+async def record_metric(redis, appointment_id: str, metric_name: str, increment: int = 1):
+    """Record metrics in Redis and check alert thresholds dynamically."""
+    try:
+        # Per-call metrics
+        call_metrics_key = f"metrics:call:{appointment_id}"
+        await redis.hincrby(call_metrics_key, metric_name, increment)
+        await redis.expire(call_metrics_key, 7200)
+        
+        # System metrics
+        system_metrics_key = "metrics:system"
+        await redis.hincrby(system_metrics_key, metric_name, increment)
+        
+        # Trigger dynamic checks
+        await check_and_log_alerts(redis)
+    except Exception as exc:
+        logger.warning("Telemetry: Failed to record metrics: %s", str(exc))
+
+
+async def check_and_log_alerts(redis):
+    """Analyze system metrics and emit alerts on high failure rates or storms."""
+    safe_redis = SafeRedis(redis)
+    try:
+        system_metrics_key = "metrics:system"
+        metrics_decoded = await safe_redis.hgetall_parsed(system_metrics_key)
+        if metrics_decoded:
+            failures = float(metrics_decoded.get("failures", 0))
+            heartbeats = float(metrics_decoded.get("heartbeats", 0))
+            reconnects = float(metrics_decoded.get("reconnects", 0))
+            
+            total = heartbeats + failures
+            if total > 50:
+                failure_rate = failures / total
+                if failure_rate > 0.2:
+                    logger.error("🚨 CALL SYSTEM UNSTABLE: HIGH_FAILURE_RATE = %.2f%%", failure_rate * 100, extra=metrics_decoded)
+                    
+            if reconnects > 100:
+                logger.error("🚨 CALL SYSTEM UNSTABLE: RECONNECT_STORM detected", extra=metrics_decoded)
+    except Exception as exc:
+        logger.warning("Telemetry: Failed to parse alerts: %s", str(exc))
+
+
+async def startup_reconcile_calls():
+    """Perform startup boot reconciliation on Mongo calls and sync to Redis state cache."""
+    logger.info("Reconciliation: Starting boot-time call state reconciliation job...")
+    db = get_db()
+    safe_redis = SafeRedis(get_redis())
+    now = utc_now()
+    
+    try:
+        # Scan non-ended calls in MongoDB
+        active_appointments = await db.appointments.find({
+            "call_status": {"$in": ["initializing", "waiting", "connected", "disconnected"]}
+        }).to_list(length=None)
+        
+        for appt in active_appointments:
+            appointment_id = str(appt["_id"])
+            updated_at = ensure_utc(appt.get("updated_at") or now)
+            age_seconds = (now - updated_at).total_seconds()
+            
+            if age_seconds < 30:
+                # Rehydrate Redis status
+                call_state_key = RedisKeys.call_state(appointment_id)
+                redis_state = "connecting" if appt.get("call_status") == "initializing" else "active"
+                version = appt.get("session_version", 0)
+                try:
+                    await safe_redis.hset(call_state_key, mapping={
+                        "state": redis_state,
+                        "version": str(version),
+                        "doctor_id": str(appt.get("doctor_id")),
+                        "patient_user_id": str(appt.get("patient_user_id") or "")
+                    })
+                    await safe_redis.expire(call_state_key, 7200)
+                    logger.info("Reconciliation: Rehydrated active call Redis state for appt %s", appointment_id)
+                except Exception as exc:
+                    logger.warning("Reconciliation: Failed to write Redis cache for appt %s: %s", appointment_id, str(exc))
+            else:
+                # Force end stale calls
+                room_name = appt.get("video_room")
+                if room_name:
+                    logger.info("Reconciliation: Terminating stale call on startup for appt %s (room %s)", appointment_id, room_name)
+                    await handle_room_finished(room_name)
+        logger.info("Reconciliation: Boot-time call state reconciliation finished.")
+    except Exception as exc:
+        logger.error("Reconciliation: Boot-time check failed: %s", str(exc))

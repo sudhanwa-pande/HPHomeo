@@ -74,6 +74,11 @@ async def lifespan(app: FastAPI):
     await FastAPILimiter.init(get_redis(), prefix="rate", http_callback=_rate_limit_callback)
     
     cron_task = asyncio.create_task(start_stuck_payment_recovery_cron())
+    
+    # Boot-time call reconciliation check
+    from app.services.call_state_machine import startup_reconcile_calls
+    asyncio.create_task(startup_reconcile_calls())
+    
     yield
     cron_task.cancel()
     

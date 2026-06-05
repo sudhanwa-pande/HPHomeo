@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 
 from app.core.config import settings
 from app.core.database import get_db
@@ -685,6 +686,7 @@ from pydantic import BaseModel
 
 class VideoTokenRequest(BaseModel):
     recovery_reason: str | None = None
+    session_id: str | None = None
 
 @router.post(
     "/appointments/{appointment_id}/video-token",
@@ -718,8 +720,14 @@ async def doctor_video_token(
 
     from app.services.call_state_machine import reconcile_call_state
     await reconcile_call_state(appointment_id)
+    from pymongo import ReadPreference
+    from pymongo.read_concern import ReadConcern
+    appointments_col = db.appointments.with_options(
+        read_preference=ReadPreference.PRIMARY,
+        read_concern=ReadConcern(level="majority")
+    )
 
-    appt = await db.appointments.find_one({"_id": appt_oid, "doctor_id": doctor["_id"]})
+    appt = await appointments_col.find_one({"_id": appt_oid, "doctor_id": doctor["_id"]})
     if not appt:
         raise HTTPException(status_code=404, detail="Appointment not found")
 
@@ -774,14 +782,13 @@ async def doctor_video_token(
     if not appt.get("doctor_joined_at"):
         update_set["doctor_joined_at"] = now
 
-    updated_appt = await db.appointments.find_one_and_update(
+    updated_appt = await appointments_col.find_one_and_update(
         {
             "_id": appt_oid,
             "call_status": {"$in": ["idle", "ended"]},
             "session_locked": {"$ne": True}
         },
         {
-            "$inc": {"session_version": 1},
             "$set": {
                 "call_status": "initializing",
                 "session_locked": True,
@@ -791,7 +798,7 @@ async def doctor_video_token(
         return_document=ReturnDocument.AFTER
     )
     if not updated_appt:
-        updated_appt = await db.appointments.find_one_and_update(
+        updated_appt = await appointments_col.find_one_and_update(
             {"_id": appt_oid},
             {"$set": update_set},
             return_document=ReturnDocument.AFTER
@@ -799,9 +806,134 @@ async def doctor_video_token(
 
     session_version = updated_appt.get("session_version") if updated_appt and updated_appt.get("session_version") is not None else 0
 
+    session_id = payload.session_id if payload else None
+
+    from app.core.redis import get_safe_redis
+    from app.utils.redis_utils import RedisKeys, LUA_ACQUIRE_LOCK
+    redis = get_safe_redis()
+
+    import time
+    import json
+    
+    # 1. Redis Quorum Health / Authority Mode Check
+    authority_mode = "redis"
+    health_key = "system:redis:health"
+    try:
+        await redis.ping()
+        await redis.redis.set(health_key, str(time.time()), ex=10)
+        health_ts_str = await redis.get_str(health_key)
+        if health_ts_str:
+            health_ts = float(health_ts_str)
+            if time.time() - health_ts > 3.0:
+                authority_mode = "degraded"
+        else:
+            authority_mode = "degraded"
+    except Exception:
+        authority_mode = "mongo"
+
+    # Define variables
+    token_id = str(uuid.uuid4())
+    epoch = 1
+
+    if authority_mode != "mongo":
+        # 2. Call Hard Timeout Check / Creation time
+        created_at_key = RedisKeys.call_created_at(appointment_id)
+        try:
+            # Check hard timeout
+            created_at_str = await redis.get_str(created_at_key)
+            if created_at_str:
+                created_at = float(created_at_str)
+                if time.time() - created_at > 7200: # 2 hours hard timeout
+                    logger.warning("call_hard_timeout_reached: appt_id=%s", appointment_id)
+                    from app.services.call_state_machine import handle_room_finished
+                    if appt.get("video_room"):
+                        await handle_room_finished(appt["video_room"])
+                    raise HTTPException(status_code=403, detail="Call hard timeout reached (max 2 hours).")
+            else:
+                await redis.redis.set(created_at_key, str(time.time()), nx=True, ex=7200)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning("Failed to verify call hard timeout or write created_at: %s", str(exc))
+
+        # 3. Session validation and rotation
+        if session_id:
+            try:
+                created_at_str = await redis.get_str(RedisKeys.active_session(session_id))
+                if created_at_str:
+                    created_at = float(created_at_str)
+                    # Session rotation: if older than 10 minutes, force generation of new session_id
+                    if time.time() - created_at > 600:
+                        session_id = None
+                else:
+                    session_id = None
+            except Exception as exc:
+                logger.warning("Failed to check active session in Redis: %s", str(exc))
+                session_id = None
+
+        if not session_id:
+            session_id = f"csm-{uuid.uuid4().hex[:8]}"
+            try:
+                await redis.redis.set(RedisKeys.active_session(session_id), str(time.time()), ex=600)
+            except Exception as exc:
+                logger.warning("Failed to write active session to Redis: %s", str(exc))
+
+        # 4. Atomic Lock & Version Acquisition (Lua)
+        join_lock_key = RedisKeys.join_lock(appointment_id)
+        call_version_key = RedisKeys.call_version(appointment_id)
+        leader_key = RedisKeys.call_leader(appointment_id)
+        try:
+            result = await redis.eval(
+                LUA_ACQUIRE_LOCK,
+                [join_lock_key, call_version_key, leader_key],
+                [str(session_version), token_id, session_id, "doctor"]
+            )
+            if result and result[0] == -1:
+                logger.warning("doctor_token_request_failed_version_mismatch: current=%s expected=%s", result[1], session_version)
+                raise HTTPException(
+                    status_code=409,
+                    detail="Connection attempt failed due to state mismatch. Please refresh."
+                )
+            elif result:
+                epoch = int(result[1])
+                lock_token = int(result[2])
+            else:
+                raise RuntimeError("Lua acquire lock script returned empty result")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning("Lua lock and version acquisition failed: %s", str(exc))
+            epoch = 1
+
+        # 5. Per-Role fencing with 10-second grace window
+        active_token_key = RedisKeys.active_token(appointment_id, "doctor")
+        prev_token_key = RedisKeys.prev_token(appointment_id, "doctor")
+        try:
+            old_token = await redis.get_str(active_token_key)
+            if old_token:
+                await redis.redis.set(prev_token_key, old_token, ex=10)
+            await redis.redis.set(active_token_key, token_id, ex=7200)
+        except Exception as exc:
+            logger.warning("Failed to write active fencing tokens: %s", str(exc))
+
+        # 6. Transition Redis State Machine to connecting
+        from app.services.call_state_machine import transition_call_redis_state
+        await transition_call_redis_state(redis.redis, appointment_id, "connecting")
+
+        # 7. Logs & Metrics
+        from app.services.call_state_machine import log_call_timeline, record_metric
+        is_reconnect = 1 if payload and payload.session_id else 0
+        await log_call_timeline(redis.redis, appointment_id, "token_request", session_id, epoch)
+        await record_metric(redis.redis, appointment_id, "reconnects" if is_reconnect else "token_requests")
+    else:
+        # Fallback in mongo mode
+        if not session_id:
+            session_id = f"csm-{uuid.uuid4().hex[:8]}"
+        epoch = 1
+
     trace_id = uuid.uuid4().hex
     identity = f"doctor:{str(doctor['_id'])}"
-    logger.info("video_token_issued", extra={"appointment_id": appointment_id, "role": "doctor", "identity": identity, "trace_id": trace_id, "session_version": session_version})
+    logger.info("video_token_issued", extra={"appointment_id": appointment_id, "role": "doctor", "identity": identity, "trace_id": trace_id, "session_version": session_version, "session_id": session_id, "epoch": epoch})
 
     try:
         join_token = create_video_token(
@@ -812,7 +944,10 @@ async def doctor_video_token(
                 "appointment_id": str(appt["_id"]),
                 "role": "doctor",
                 "trace_id": trace_id,
-                "session_version": session_version
+                "session_version": session_version,
+                "session_id": session_id,
+                "epoch": epoch,
+                "token_id": token_id
             },
             ttl_seconds=7200,
         )
@@ -826,6 +961,8 @@ async def doctor_video_token(
         "room": room,
         "token": join_token,
         "session_version": session_version,
+        "session_id": session_id,
+        "epoch": epoch
     }
 
 
@@ -936,6 +1073,12 @@ async def doctor_end_call(
 
 class CallHeartbeatRequest(BaseModel):
     session_version: int | None = None
+    session_id: str | None = None
+    epoch: int | None = None
+    seq: int | None = None
+    token_id: str | None = None
+    sent_at: float | None = None
+    rtt: float | None = None
 
 @router.post("/appointments/{appointment_id}/call/heartbeat")
 async def doctor_call_heartbeat(
@@ -951,35 +1094,267 @@ async def doctor_call_heartbeat(
     except Exception:
         raise HTTPException(status_code=404, detail="Appointment not found")
 
-    appt = await db.appointments.find_one({"_id": appt_oid, "doctor_id": doctor["_id"]})
-    if not appt:
-        raise HTTPException(status_code=404, detail="Appointment not found")
+    from app.core.redis import get_safe_redis
+    from app.utils.redis_utils import RedisKeys
+    redis = get_safe_redis()
 
-    # Validate session version if provided
-    db_version = appt.get("session_version", 0)
+    # Retrieve local variables
+    session_id = payload.session_id if payload else None
+    epoch = payload.epoch if payload else None
+    seq = payload.seq if payload else None
+    token_id = payload.token_id if payload else None
     incoming_version = payload.session_version if payload else None
-    if incoming_version is not None and incoming_version != db_version:
+    sent_at = payload.sent_at if payload else None
+    client_rtt = payload.rtt if payload else None
+
+    # Load db metadata early for consistency
+    from pymongo import ReadPreference
+    from pymongo.read_concern import ReadConcern
+    appointments_col = db.appointments.with_options(
+        read_preference=ReadPreference.PRIMARY,
+        read_concern=ReadConcern(level="majority")
+    )
+    
+    call_state_key = RedisKeys.call_state(appointment_id)
+    db_version = 0
+    db_call_status = "idle"
+    try:
+        redis_meta = await redis.hgetall_parsed(call_state_key)
+        if redis_meta:
+            db_version = int(redis_meta.get("version", 0))
+            db_call_status = str(redis_meta.get("status", "idle"))
+        else:
+            appt = await appointments_col.find_one({"_id": appt_oid})
+            if appt:
+                db_version = appt.get("session_version", 0)
+                db_call_status = appt.get("call_status", "idle")
+    except Exception as exc:
+        logger.warning("Failed to read Redis call metadata, falling back to Mongo: %s", str(exc))
+        appt = await appointments_col.find_one({"_id": appt_oid})
+        if appt:
+            db_version = appt.get("session_version", 0)
+            db_call_status = appt.get("call_status", "idle")
+
+    # 1. Heartbeat Deadline Awareness check (Adaptive RTT Clamped Timeout)
+    import time
+    if sent_at:
+        effective_rtt = min(client_rtt or 0.0, 2.0)
+        deadline = max(5.0, 3.0 * effective_rtt)
+        age = time.time() - sent_at
+        if age > deadline:
+            logger.warning("heartbeat_deadline_exceeded: age=%fs deadline=%fs RTT=%fs appt_id=%s", age, deadline, client_rtt or 0.0, appointment_id)
+            return {
+                "status": "ok",
+                "call_status": db_call_status,
+                "session_version": db_version,
+                "epoch": epoch or 1,
+                "reconnect": { "strategy": "normal", "retry_after_ms": 1500 },
+                "media_policy": "normal",
+                "terminate": False,
+                "ignored": True,
+                "server_time": time.time()
+            }
+
+    # 2. Control-Plane Kill Switch
+    if not settings.CALL_CONTROL_ENABLED:
+        return {
+            "status": "ok",
+            "call_status": "active",
+            "reconnect": { "strategy": "client_only" },
+            "media_policy": "none",
+            "terminate": False,
+            "server_time": time.time()
+        }
+
+    # 3. Redis Quorum Health / Authority Mode Check
+    authority_mode = "redis"
+    health_key = "system:redis:health"
+    try:
+        await redis.ping()
+        await redis.redis.set(health_key, str(time.time()), ex=10)
+        health_ts_str = await redis.get_str(health_key)
+        if health_ts_str and (time.time() - float(health_ts_str) <= 3.0):
+            authority_mode = "redis"
+        else:
+            authority_mode = "degraded"
+    except Exception:
+        authority_mode = "mongo"
+
+    # 4. Sequence Deduplication (wrapped in try/except)
+    if session_id and seq is not None and authority_mode == "redis":
+        try:
+            seq_key = f"heartbeat_seq:{session_id}"
+            resp_key = f"heartbeat_response:{session_id}"
+            last_seq = await redis.get_str(seq_key)
+            if last_seq is not None and int(seq) <= int(last_seq):
+                cached_res = await redis.get_str(resp_key)
+                if cached_res:
+                    res_dict = json.loads(cached_res)
+                    res_dict["server_time"] = time.time()
+                    return res_dict
+        except Exception as exc:
+            logger.warning("Auxiliary sequence deduplication error: %s", str(exc))
+
+    # 5. Bootstrap Mode: Rehydrate Redis call state if missing
+    if authority_mode == "redis":
+        try:
+            call_exists = await redis.exists(call_state_key)
+            if not call_exists:
+                appt = await appointments_col.find_one({"_id": appt_oid})
+                if appt:
+                    await redis.hset(call_state_key, mapping={
+                        "status": appt.get("call_status", "idle"),
+                        "version": str(appt.get("session_version", 0)),
+                        "doctor_id": str(appt.get("doctor_id")),
+                        "patient_user_id": str(appt.get("patient_user_id") or "")
+                    })
+                    await redis.expire(call_state_key, 7200)
+        except Exception as exc:
+            logger.warning("Redis rehydration failed: %s", str(exc))
+
+    # 6. Validate session version if provided (Strict clock check: incoming >= db_version)
+    if incoming_version is not None and incoming_version < db_version:
         logger.warning(
             "doctor_heartbeat_session_version_mismatch: db=%s incoming=%s appt_id=%s",
             db_version, incoming_version, appointment_id
         )
         raise HTTPException(status_code=409, detail="Outdated session version")
 
-    res = await db.appointments.update_one(
-        {
-            "_id": appt_oid,
-            "doctor_id": doctor["_id"],
-            "doctor_participant": {"$ne": None}
-        },
-        {
-            "$set": {
-                "doctor_participant.last_seen": now,
-                "doctor_participant.connected": True,
-                "call_last_activity_at": now,
-                "updated_at": now
-            }
+    # 7. Epoch Fencing & Timeout Check
+    leader_key = RedisKeys.call_leader(appointment_id)
+    terminate = False
+    leader_epoch = epoch if epoch is not None else 1
+    is_zombie = False
+    media_policy = "normal"
+    
+    if authority_mode != "mongo":
+        # 7a. Control-Plane Kill Switch verification key check
+        try:
+            if await redis.exists(RedisKeys.kill_switch(appointment_id)):
+                logger.warning("call_kill_switch_triggered_heartbeat: appt_id=%s", appointment_id)
+                terminate = True
+        except Exception as exc:
+            logger.warning("Failed to check control plane kill switch: %s", str(exc))
+
+        # 7b. Call Hard Timeout Check
+        if not terminate:
+            created_at_key = RedisKeys.call_created_at(appointment_id)
+            try:
+                created_at_str = await redis.get_str(created_at_key)
+                if created_at_str:
+                    created_at = float(created_at_str)
+                    if time.time() - created_at > 7200: # 2 hours hard timeout
+                        logger.warning("call_hard_timeout_reached_heartbeat: appt_id=%s", appointment_id)
+                        from app.services.call_state_machine import handle_room_finished
+                        appt = await appointments_col.find_one({"_id": appt_oid})
+                        if appt and appt.get("video_room"):
+                            await handle_room_finished(appt["video_room"])
+                        terminate = True
+            except Exception as exc:
+                logger.warning("Failed to check hard timeout on heartbeat: %s", str(exc))
+
+        # 7c. Epoch fencing check
+        if not terminate and session_id and epoch is not None:
+            try:
+                current_leader = await redis.get_str(leader_key)
+                if current_leader:
+                    leader_data = json.loads(current_leader)
+                    leader_epoch = int(leader_data.get("epoch", 1))
+                    if (leader_data.get("session_id") != session_id) or (leader_epoch != int(epoch)):
+                        logger.warning("doctor_heartbeat_fenced_out: leader_session=%s incoming_session=%s appt_id=%s", leader_data.get("session_id"), session_id, appointment_id)
+                        terminate = True
+                else:
+                    await redis.redis.set(leader_key, json.dumps({ "session_id": session_id, "epoch": epoch }), ex=5)
+            except Exception as exc:
+                logger.warning("Fencing lease evaluation failed: %s", str(exc))
+
+        # 7d. Per-Role Fencing Token Check with Zombie Grace Isolation
+        if not terminate and token_id:
+            active_token_key = RedisKeys.active_token(appointment_id, "doctor")
+            prev_token_key = RedisKeys.prev_token(appointment_id, "doctor")
+            try:
+                active_token_str = await redis.get_str(active_token_key)
+                prev_token_str = await redis.get_str(prev_token_key)
+                
+                if active_token_str:
+                    if token_id == active_token_str:
+                        is_zombie = False
+                    elif token_id == prev_token_str:
+                        is_zombie = True
+                        media_policy = "none"
+                        logger.info("doctor_heartbeat_zombie_isolated: token_id=%s appt_id=%s", token_id, appointment_id)
+                    else:
+                        logger.warning("doctor_heartbeat_token_fenced_out: expected=%s (prev=%s) got=%s appt_id=%s", active_token_str, prev_token_str, token_id, appointment_id)
+                        terminate = True
+            except Exception as exc:
+                logger.warning("Per-role token fencing check failed: %s", str(exc))
+
+    if terminate:
+        if authority_mode != "mongo":
+            from app.services.call_state_machine import log_call_timeline, record_metric
+            await log_call_timeline(redis.redis, appointment_id, "terminate", session_id, epoch)
+            await record_metric(redis.redis, appointment_id, "failures")
+        return {
+            "status": "terminated",
+            "terminate": True,
+            "call_status": "ended",
+            "session_version": db_version,
+            "epoch": leader_epoch,
+            "server_time": time.time(),
+            "mode": "degraded" if authority_mode != "redis" else settings.CALL_RECOVERY_MODE
         }
+
+    # 8. Liveness Lease (15s TTL) - Skip if Zombie client
+    if authority_mode != "mongo" and not is_zombie:
+        try:
+            await redis.redis.setex(f"call_participant:{appointment_id}:doctor", 15, "1")
+        except Exception as exc:
+            logger.warning("Failed to write participant liveness lease to Redis: %s", str(exc))
+
+    # 9. Offload side-effects to background task (Pass connected/zombie flags)
+    from app.worker.tasks.appointment_tasks import process_call_heartbeat
+    process_call_heartbeat.apply_async(args=[appointment_id, "doctor", session_id, epoch, db_version, not is_zombie, is_zombie])
+
+    # 10. Build response
+    response_data = {
+        "status": "ok",
+        "call_status": db_call_status,
+        "session_version": db_version,
+        "epoch": leader_epoch,
+        "reconnect": {
+            "strategy": "normal",
+            "retry_after_ms": 1500
+        },
+        "media_policy": media_policy,
+        "terminate": False,
+        "server_time": time.time(),
+        "mode": "degraded" if authority_mode != "redis" else settings.CALL_RECOVERY_MODE
+    }
+
+    # 11. Structured logs & cache
+    leader_session_id = ""
+    if authority_mode != "mongo":
+        from app.services.call_state_machine import log_call_timeline, record_metric
+        await log_call_timeline(redis.redis, appointment_id, "heartbeat", session_id, epoch, rtt=client_rtt)
+        await record_metric(redis.redis, appointment_id, "heartbeats")
+        try:
+            leader_val = await redis.get_str(leader_key)
+            if leader_val:
+                leader_session_id = json.loads(leader_val).get("session_id", "")
+        except Exception:
+            pass
+
+    # structured tracing metric log
+    logger.info(
+        "METRIC event=%s session_id=%s token_id=%s authority_version=%d role=%s leader_session_id=%s trace_id=%s",
+        "heartbeat", session_id or "", token_id or "", db_version, "doctor", leader_session_id, token_id or ""
     )
-    if res.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Active call participant not found")
-    return {"status": "ok"}
+
+    if session_id and seq is not None and authority_mode == "redis":
+        try:
+            await redis.redis.setex(f"heartbeat_seq:{session_id}", 30, str(seq))
+            await redis.redis.setex(f"heartbeat_response:{session_id}", 30, json.dumps(response_data))
+        except Exception as exc:
+            logger.warning("Failed to cache heartbeat response: %s", str(exc))
+
+    return response_data

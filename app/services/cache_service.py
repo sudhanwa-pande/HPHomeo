@@ -6,7 +6,7 @@ from typing import Any
 
 from bson import ObjectId
 
-from app.core.redis import get_redis
+from app.core.redis import get_safe_redis
 
 logger = logging.getLogger(__name__)
 
@@ -118,11 +118,8 @@ def doctor_daily_stats_key(doctor_id: str, days: int) -> str:
 
 async def cache_get_json(key: str) -> Any | None:
     try:
-        redis = get_redis()
-        value = await redis.get(key)
-        if not value:
-            return None
-        return json.loads(value)
+        redis = get_safe_redis()
+        return await redis.get_json(key)
     except Exception:
         logger.exception("Cache get failed", extra={"cache_key": key})
         return None
@@ -143,7 +140,7 @@ async def cache_set_json(key: str, value: Any, ttl_seconds: int = TTL_5_MINUTES)
         return str(v)
 
     try:
-        redis = get_redis()
+        redis = get_safe_redis()
         await redis.set(key, json.dumps(value, default=_json_default), ex=ttl_seconds)
         
         # Track dynamic keys for SCAN-free invalidation
@@ -184,7 +181,7 @@ async def cache_delete_keys(*keys: str) -> None:
         valid_keys = [k for k in keys if k]
         if not valid_keys:
             return
-        redis = get_redis()
+        redis = get_safe_redis()
         await redis.delete(*valid_keys)
     except Exception:
         logger.exception("Cache delete failed", extra={"cache_keys": list(keys)})
@@ -192,12 +189,13 @@ async def cache_delete_keys(*keys: str) -> None:
 
 async def cache_delete_pattern(pattern: str, batch_size: int = 200) -> None:
     try:
-        redis = get_redis()
+        redis = get_safe_redis()
         cursor = 0
         while True:
             cursor, keys = await redis.scan(cursor=cursor, match=pattern, count=batch_size)
             if keys:
-                await redis.delete(*keys)
+                valid_keys = [k.decode("utf-8") if isinstance(k, bytes) else str(k) for k in keys]
+                await redis.delete(*valid_keys)
             if cursor == 0:
                 break
     except Exception:
@@ -221,17 +219,18 @@ async def invalidate_doctor_cache(
         doctor_templates_key(doctor_id),
         doctor_stats_key(doctor_id),
     )
-    redis = get_redis()
+    redis = get_safe_redis()
 
     # Invalidate all daily stats variants (days=1, 7, 30, etc.)
     # Now handled via tracked keys below, but we can also manually clear specific tracked subsets if needed.
     # To maintain exact same behavior, we'll clear all tracked keys for this doctor if not normalized_day.
 
     if invalidate_list:
-        list_keys_bytes = await redis.smembers("doctors:tracked_list_keys")
-        if list_keys_bytes:
-            list_keys = [k.decode("utf-8") if isinstance(k, bytes) else k for k in list_keys_bytes]
-            await cache_delete_keys(*list_keys)
+        list_keys = await redis.smembers_str("doctors:tracked_list_keys")
+        if list_keys:
+            # Filter out None values just in case
+            valid_list_keys = [k for k in list_keys if k is not None]
+            await cache_delete_keys(*valid_list_keys)
             await cache_delete_keys("doctors:tracked_list_keys")
 
     if normalized_day:
@@ -242,10 +241,10 @@ async def invalidate_doctor_cache(
         return
 
     track_key = f"doctor:tracked_keys:{doctor_id}"
-    tracked_bytes = await redis.smembers(track_key)
-    if tracked_bytes:
-        tracked_keys = [k.decode("utf-8") if isinstance(k, bytes) else k for k in tracked_bytes]
-        await cache_delete_keys(*tracked_keys)
+    tracked_keys = await redis.smembers_str(track_key)
+    if tracked_keys:
+        valid_tracked_keys = [k for k in tracked_keys if k is not None]
+        await cache_delete_keys(*valid_tracked_keys)
         await cache_delete_keys(track_key)
 
 
@@ -257,12 +256,12 @@ async def invalidate_patient_cache(patient_id: str) -> None:
         patient_receipts_key(patient_id),
         appt_prefix,
     )
-    redis = get_redis()
+    redis = get_safe_redis()
     track_key = f"patient:tracked_keys:{patient_id}"
-    tracked_bytes = await redis.smembers(track_key)
-    if tracked_bytes:
-        tracked_keys = [k.decode("utf-8") if isinstance(k, bytes) else k for k in tracked_bytes]
-        await cache_delete_keys(*tracked_keys)
+    tracked_keys = await redis.smembers_str(track_key)
+    if tracked_keys:
+        valid_tracked_keys = [k for k in tracked_keys if k is not None]
+        await cache_delete_keys(*valid_tracked_keys)
         await cache_delete_keys(track_key)
 
 

@@ -189,6 +189,8 @@ class Settings(BaseSettings):
     CALL_DISCONNECT_TIMEOUT_SECONDS: int = 900  # 15 minutes
     CALL_HEARTBEAT_INTERVAL_SECONDS: int = 15
     CALL_HEARTBEAT_TTL_SECONDS: int = 45
+    CALL_CONTROL_ENABLED: bool = True
+    CALL_RECOVERY_MODE: Literal["normal", "degraded", "emergency"] = "normal"
 
     # Optional startup bootstrap for first admin user (recommended for dev only).
     ADMIN_BOOTSTRAP_ENABLED: bool = False

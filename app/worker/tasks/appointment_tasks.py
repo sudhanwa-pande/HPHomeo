@@ -1034,7 +1034,7 @@ async def enforce_disconnect_timeout(appointment_id: str):
 async def check_call_timeouts():
     db = await get_task_db()
     now = utc_now()
-    cutoff = now - timedelta(seconds=20)
+    cutoff = now - timedelta(seconds=45)
 
     # Find active calls where either participant was last seen before cutoff
     cursor = db.appointments.find({
@@ -1087,7 +1087,7 @@ async def reconcile_active_calls():
     """Periodically reconcile active calls to ensure DB states match LiveKit reality."""
     db = await get_task_db()
     cursor = db.appointments.find({
-        "call_status": {"$in": ["waiting", "connected"]}
+        "call_status": {"$in": ["initializing", "waiting", "connected"]}
     })
     
     appointments = await cursor.to_list(length=100)
@@ -1097,3 +1097,47 @@ async def reconcile_active_calls():
     from app.services.call_state_machine import reconcile_call_state
     for appt in appointments:
         await reconcile_call_state(str(appt["_id"]))
+
+
+@celery_app.task(
+    name="app.worker.tasks.appointment_tasks.process_call_heartbeat",
+    base=BaseTaskWithDLQ,
+    autoretry_for=(Exception,),
+    max_retries=3,
+    retry_backoff=True,
+    retry_jitter=True,
+)
+@async_task
+async def process_call_heartbeat(appointment_id: str, role: str, session_id: str, epoch: int, session_version: int, connected: bool = True, zombie: bool = False):
+    import random
+    from app.utils.time import utc_now
+    from app.services.call_state_machine import reconcile_call_state
+    
+    db = await get_task_db()
+    now = utc_now()
+    try:
+        appt_oid = ObjectId(appointment_id)
+    except Exception:
+        logger.warning("process_call_heartbeat: invalid appointment_id=%s", appointment_id)
+        return
+
+    participant_prefix = "doctor_participant" if role == "doctor" else "patient_participant"
+    await db.appointments.update_one(
+        {
+            "_id": appt_oid,
+            f"{participant_prefix}": {"$ne": None}
+        },
+        {
+            "$set": {
+                f"{participant_prefix}.last_seen": now,
+                f"{participant_prefix}.connected": connected,
+                f"{participant_prefix}.zombie": zombie,
+                "call_last_activity_at": now,
+                "updated_at": now
+            }
+        }
+    )
+
+    if random.random() < 0.05:
+        logger.info("process_call_heartbeat: running 5%% sampling LiveKit check for appointment_id=%s", appointment_id)
+        await reconcile_call_state(appointment_id)

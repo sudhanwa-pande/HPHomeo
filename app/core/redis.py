@@ -3,11 +3,13 @@ import logging
 from redis.asyncio import Redis
 
 from app.core.config import settings
+from app.utils.redis_utils import SafeRedis
 
 logger = logging.getLogger(__name__)
 
 _redis_client: Redis | None = None
 _redis_pubsub_client: Redis | None = None
+_safe_redis_client: SafeRedis | None = None
 
 # Pub/Sub pool size — each open SSE tab = 1 connection held.
 # For SaaS scale: (max_concurrent_doctors × avg_tabs) + headroom.
@@ -16,7 +18,7 @@ PUBSUB_MAX_CONNECTIONS = 200
 
 
 async def connect_redis() -> None:
-    global _redis_client, _redis_pubsub_client
+    global _redis_client, _redis_pubsub_client, _safe_redis_client
 
     _redis_client = Redis.from_url(
         settings.REDIS_URL,
@@ -27,6 +29,7 @@ async def connect_redis() -> None:
         decode_responses=True,
     )
     await _redis_client.ping()
+    _safe_redis_client = SafeRedis(_redis_client)
 
     # Dedicated client for Pub/Sub — SSE subscribers hold connections for the
     # lifetime of the stream (minutes/hours), so they need:
@@ -42,6 +45,7 @@ async def connect_redis() -> None:
         decode_responses=True,
     )
     await _redis_pubsub_client.ping()
+
     logger.info(
         "Redis connected — general pool=%d, pubsub pool=%d",
         settings.REDIS_MAX_CONNECTIONS,
@@ -71,6 +75,12 @@ def get_redis() -> Redis:
     return _redis_client
 
 
+def get_safe_redis() -> SafeRedis:
+    if _safe_redis_client is None:
+        raise RuntimeError("Redis not initialized. Startup event not executed.")
+    return _safe_redis_client
+
+
 def get_redis_pubsub() -> Redis:
     """Return the Redis client dedicated to Pub/Sub operations (SSE streams)."""
     if _redis_pubsub_client is None:
@@ -79,10 +89,11 @@ def get_redis_pubsub() -> Redis:
 
 
 async def close_redis() -> None:
-    global _redis_client, _redis_pubsub_client
+    global _redis_client, _redis_pubsub_client, _safe_redis_client
     if _redis_pubsub_client is not None:
         await _redis_pubsub_client.aclose()
     _redis_pubsub_client = None
     if _redis_client is not None:
         await _redis_client.aclose()
     _redis_client = None
+    _safe_redis_client = None
