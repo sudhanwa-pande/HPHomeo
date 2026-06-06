@@ -154,7 +154,7 @@ class PublicAppointmentView(BaseModel):
     payment_choice: Literal["pay_now", "pay_at_clinic"]
     consultation_fee: Optional[int] = None
     video_enabled: bool = False
-    call_status: Literal["idle", "waiting", "connected", "disconnected", "ended"] = "idle"
+    call_status: Literal["idle", "waiting", "initializing", "connected", "disconnected", "ended"] = "idle"
 
     # Useful for UI
     appointment_type: AppointmentType = "new"
