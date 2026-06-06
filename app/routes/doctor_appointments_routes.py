@@ -1088,6 +1088,8 @@ async def doctor_call_heartbeat(
     doctor=Depends(get_current_doctor),
 ):
     """Periodic active call heartbeat from doctor to track presence."""
+    import time
+    import json
     db = get_db()
     now = utc_now()
     try:
@@ -1164,7 +1166,6 @@ async def doctor_call_heartbeat(
             logger.warning("Failed duplicate ts check: %s", str(exc))
 
     # 1. Heartbeat Deadline Awareness check (Adaptive RTT Clamped Timeout)
-    import time
     if sent_at:
         effective_rtt = min(client_rtt or 0.0, 2.0)
         deadline = max(5.0, 3.0 * effective_rtt)
