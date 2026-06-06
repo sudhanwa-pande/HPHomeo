@@ -458,12 +458,13 @@ async def public_video_token(
         # 4. Atomic Lock & Version Acquisition (Lua)
         join_lock_key = RedisKeys.join_lock(appointment_id)
         call_version_key = RedisKeys.call_version(appointment_id)
-        leader_key = RedisKeys.call_leader(appointment_id)
+        leader_key = RedisKeys.call_leader(appointment_id, "patient")
+        epoch_key = RedisKeys.epoch_key(appointment_id, "patient")
         try:
             result = await redis.eval(
                 LUA_ACQUIRE_LOCK,
-                [join_lock_key, call_version_key, leader_key],
-                [str(session_version), token_id, session_id, "patient"]
+                [join_lock_key, call_version_key, leader_key, epoch_key],
+                [str(session_version), token_id, session_id]
             )
             if result and result[0] == -1:
                 logger.warning("public_token_request_failed_version_mismatch: current=%s expected=%s", result[1], session_version)
@@ -495,7 +496,7 @@ async def public_video_token(
 
         # 6. Transition Redis State Machine to connecting
         from app.services.call_state_machine import transition_call_redis_state
-        await transition_call_redis_state(redis.redis, appointment_id, "connecting")
+        await transition_call_redis_state(redis.redis, appointment_id, "connecting", version=session_version)
 
         # 7. Logs & Metrics
         from app.services.call_state_machine import log_call_timeline, record_metric
@@ -599,9 +600,8 @@ async def public_call_heartbeat(
     except Exception:
         raise HTTPException(status_code=404, detail="Appointment not found")
 
-    from app.core.redis import get_redis
     from app.core.redis import get_safe_redis
-    from app.utils.redis_utils import RedisKeys
+    from app.utils.redis_utils import RedisKeys, LUA_REFRESH_LEASE, validate_leader_data, RedisCorruptionError
     redis = get_safe_redis()
 
     # Retrieve local variables
@@ -628,7 +628,7 @@ async def public_call_heartbeat(
         redis_meta = await redis.hgetall_parsed(call_state_key)
         if redis_meta:
             db_version = int(redis_meta.get("version", 0))
-            db_call_status = str(redis_meta.get("status", "idle"))
+            db_call_status = str(redis_meta.get("state", "idle"))
         else:
             appt = await appointments_col.find_one({"_id": appt_oid})
             if appt:
@@ -640,6 +640,35 @@ async def public_call_heartbeat(
         if appt:
             db_version = appt.get("session_version", 0)
             db_call_status = appt.get("call_status", "idle")
+
+    # Sequence/Rate check early (Rate-Limit duplicate heartbeat packets within 500ms - return cached response)
+    last_ts_key = RedisKeys.last_ts_key(appointment_id, "patient")
+    now_ms = int(time.time() * 1000)
+    if token_id:
+        try:
+            last_ts_str = await redis.get_str(last_ts_key)
+            if last_ts_str:
+                last_ts = int(last_ts_str)
+                if 0 <= now_ms - last_ts < 500:
+                    resp_key = f"heartbeat_response:{session_id}"
+                    cached_res = await redis.get_str(resp_key)
+                    if cached_res:
+                        res_dict = json.loads(cached_res)
+                        res_dict["server_time"] = time.time()
+                        return res_dict
+                    return {
+                        "status": "ok",
+                        "call_status": db_call_status,
+                        "session_version": db_version,
+                        "epoch": epoch or 1,
+                        "reconnect": { "strategy": "normal", "retry_after_ms": 1500 },
+                        "media_policy": "normal",
+                        "terminate": False,
+                        "server_time": time.time(),
+                        "mode": "degraded" if authority_mode != "redis" else settings.CALL_RECOVERY_MODE
+                    }
+        except Exception as exc:
+            logger.warning("Failed duplicate ts check: %s", str(exc))
 
     # 1. Heartbeat Deadline Awareness check (Adaptive RTT Clamped Timeout)
     import time
@@ -710,7 +739,7 @@ async def public_call_heartbeat(
                 if appt:
                     validate_patient_token(appt, token, now)
                     await redis.hset(call_state_key, mapping={
-                        "status": appt.get("call_status", "idle"),
+                        "state": appt.get("call_status", "idle"),
                         "version": str(appt.get("session_version", 0)),
                         "doctor_id": str(appt.get("doctor_id")),
                         "patient_user_id": str(appt.get("patient_user_id") or "")
@@ -733,11 +762,15 @@ async def public_call_heartbeat(
     leader_epoch = epoch if epoch is not None else 1
     is_zombie = False
     media_policy = "normal"
-    
+
+    if db_call_status == "ended":
+        logger.warning("public_heartbeat_call_already_ended: appt_id=%s", appointment_id)
+        terminate = True
+
     if authority_mode != "mongo":
         # 7a. Control-Plane Kill Switch verification key check
         try:
-            if await redis.exists(RedisKeys.kill_switch(appointment_id)):
+            if await redis.get_str(RedisKeys.kill_switch(appointment_id)):
                 logger.warning("call_kill_switch_triggered_heartbeat: appt_id=%s", appointment_id)
                 terminate = True
         except Exception as exc:
@@ -762,43 +795,91 @@ async def public_call_heartbeat(
             except Exception as exc:
                 logger.warning("Failed to check hard timeout on heartbeat: %s", str(exc))
 
-        # 7c. Epoch fencing check
-        if not terminate and session_id and epoch is not None:
-            try:
-                current_leader = await redis.get_str(leader_key)
-                if current_leader:
-                    leader_data = json.loads(current_leader)
-                    leader_epoch = int(leader_data.get("epoch", 1))
-                    if (leader_data.get("session_id") != session_id) or (leader_epoch != int(epoch)):
-                        logger.warning("public_heartbeat_fenced_out: leader_session=%s incoming_session=%s appt_id=%s", leader_data.get("session_id"), session_id, appointment_id)
-                        terminate = True
-                else:
-                    await redis.redis.set(leader_key, json.dumps({ "session_id": session_id, "epoch": epoch }), ex=5)
-            except Exception as exc:
-                logger.warning("Fencing lease evaluation failed: %s", str(exc))
-
-        # 7d. Per-Role Fencing Token Check with Zombie Grace Isolation
+        # 7c. Heartbeat Silence Timeout Check with degraded grace tiers
+        last_seen_key = RedisKeys.last_seen_key(appointment_id, "patient")
         if not terminate and token_id:
-            active_token_key = RedisKeys.active_token(appointment_id, "patient")
-            prev_token_key = RedisKeys.prev_token(appointment_id, "patient")
             try:
-                active_token_str = await redis.get_str(active_token_key)
-                prev_token_str = await redis.get_str(prev_token_key)
-                
-                if active_token_str:
-                    if token_id == active_token_str:
-                        is_zombie = False
-                    elif token_id == prev_token_str:
-                        is_zombie = True
-                        media_policy = "none"
-                        logger.info("public_heartbeat_zombie_isolated: token_id=%s appt_id=%s", token_id, appointment_id)
-                    else:
-                        logger.warning("public_heartbeat_token_fenced_out: expected=%s (prev=%s) got=%s appt_id=%s", active_token_str, prev_token_str, token_id, appointment_id)
+                last_seen_str = await redis.get_str(last_seen_key)
+                if last_seen_str:
+                    last_seen = float(last_seen_str)
+                    effective_rtt = min(client_rtt or 0.0, 2.0)
+                    deadline = max(5.0, 3.0 * effective_rtt)
+                    silence_duration = max(0.0, time.time() - last_seen)
+                    if silence_duration > 4 * deadline:
+                        logger.warning("public_heartbeat_silence_exceeded: silence=%fs limit=%fs appt_id=%s", silence_duration, 4 * deadline, appointment_id)
                         terminate = True
+                        terminate_reason = "silence_timeout"
+                    elif silence_duration > 2 * deadline:
+                        logger.warning("public_heartbeat_silence_degraded: silence=%fs limit=%fs appt_id=%s - restricting media", silence_duration, 2 * deadline, appointment_id)
+                        media_policy = "restricted"
             except Exception as exc:
-                logger.warning("Per-role token fencing check failed: %s", str(exc))
+                logger.warning("Failed to check heartbeat silence limit: %s", str(exc))
+
+        # 7d. Atomic Lease Refresh and Recovery (Lua)
+        if not terminate and token_id and session_id and epoch is not None:
+            try:
+                active_token_key = RedisKeys.active_token(appointment_id, "patient")
+                epoch_key = RedisKeys.epoch_key(appointment_id, "patient")
+                kill_switch_key = RedisKeys.kill_switch(appointment_id)
+                leader_key = RedisKeys.call_leader(appointment_id, "patient")
+                
+                effective_rtt = min(client_rtt or 0.0, 2.0)
+                deadline = max(5.0, 3.0 * effective_rtt)
+                lease_ttl = int(max(15.0, 3.0 * deadline))
+
+                result = await redis.eval(
+                    LUA_REFRESH_LEASE,
+                    [leader_key, active_token_key, epoch_key, kill_switch_key],
+                    [token_id, session_id, str(epoch), str(db_version), str(lease_ttl)]
+                )
+                
+                if result:
+                    status = int(result[0])
+                    if status == -4:
+                        logger.warning("public_heartbeat_kill_switch_triggered_lua: appt_id=%s", appointment_id)
+                        terminate = True
+                        terminate_reason = "kill_switch_lua"
+                    elif status == -3:
+                        prev_token_key = RedisKeys.prev_token(appointment_id, "patient")
+                        prev_token_str = await redis.get_str(prev_token_key)
+                        if token_id == prev_token_str:
+                            is_zombie = True
+                            media_policy = "none"
+                            logger.info("public_heartbeat_zombie_isolated: token_id=%s appt_id=%s", token_id, appointment_id)
+                        else:
+                            logger.warning("public_heartbeat_token_fenced_out: expected_active got=%s appt_id=%s", token_id, appointment_id)
+                            terminate = True
+                            terminate_reason = "token_mismatch"
+                    elif status == -2:
+                        logger.warning("public_heartbeat_stale_epoch: incoming=%s stored_epoch=%s appt_id=%s", epoch, result[1], appointment_id)
+                        terminate = True
+                        terminate_reason = "stale_epoch"
+                    elif status <= 0:
+                        logger.warning("public_heartbeat_lease_failed_status: status=%s appt_id=%s", status, appointment_id)
+                        terminate = True
+                        terminate_reason = "lua_reject"
+                    else:
+                        leader_epoch = int(result[1])
+                        # Dynamic epoch clamping if client is ahead of leader
+                        if epoch > leader_epoch:
+                            leader_epoch = epoch
+                        leader_session_id = result[2]
+                        if isinstance(leader_session_id, bytes):
+                            leader_session_id = leader_session_id.decode("utf-8")
+                else:
+                    logger.warning("LUA_REFRESH_LEASE returned empty result")
+                    terminate = True
+                    terminate_reason = "lua_empty"
+            except Exception as exc:
+                logger.error("METRIC redis_corruption details=%s key=%s", str(exc), leader_key)
+                terminate = True
+                terminate_reason = "json_corruption"
 
     if terminate:
+        logger.warning(
+            "METRIC event=heartbeat_failed reason=%s session_id=%s token_id=%s epoch=%s leader_epoch=%s appt_id=%s",
+            terminate_reason, session_id or "", token_id or "", epoch or "", leader_epoch, appointment_id
+        )
         if authority_mode != "mongo":
             from app.services.call_state_machine import log_call_timeline, record_metric
             await log_call_timeline(redis.redis, appointment_id, "terminate", session_id, epoch)
@@ -813,14 +894,16 @@ async def public_call_heartbeat(
             "mode": "degraded" if authority_mode != "redis" else settings.CALL_RECOVERY_MODE
         }
 
-    # 8. Liveness Lease (15s TTL) - Skip if Zombie client
+    # 8. Update successful heartbeat timestamps & telemetry (Skip if zombie client)
     if authority_mode != "mongo" and not is_zombie:
         try:
+            await redis.redis.setex(last_seen_key, 120, str(time.time()))
+            await redis.redis.set(last_ts_key, str(now_ms), ex=5)
             await redis.redis.setex(f"call_participant:{appointment_id}:patient", 15, "1")
         except Exception as exc:
-            logger.warning("Failed to write participant liveness lease to Redis: %s", str(exc))
+            logger.warning("Failed to write participant timestamps/liveness lease to Redis: %s", str(exc))
 
-    # 9. Offload side-effects to background task (Pass connected/zombie flags)
+    # 9. Offload side-effects to background task
     from app.worker.tasks.appointment_tasks import process_call_heartbeat
     process_call_heartbeat.apply_async(args=[appointment_id, "patient", session_id, epoch, db_version, not is_zombie, is_zombie])
 

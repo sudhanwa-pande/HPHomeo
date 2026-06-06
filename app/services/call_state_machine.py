@@ -398,10 +398,18 @@ async def handle_room_finished(room_name: str) -> None:
     if result.modified_count == 0:
         return
 
-    # Clear any disconnect timeout
+    # Clear all video call coordination Redis keys
     redis = get_redis()
-    await redis.delete(_disconnect_key(appointment_id))
-    await redis.delete(RedisKeys.call_version(appointment_id))
+    keys = get_call_coordination_keys(appointment_id)
+    try:
+        await redis.delete(*keys)
+    except Exception as e:
+        logger.warning("handle_room_finished: failed to delete Redis keys: %s", str(e))
+
+    doctor_id = str(appt.get("doctor_id")) if appt.get("doctor_id") else None
+    if doctor_id:
+        await _clear_heartbeat(redis, appointment_id, doctor_id)
+
     await transition_call_redis_state(redis, appointment_id, "ended")
 
     logger.info(
@@ -689,11 +697,39 @@ async def handle_disconnect_timeout(appointment_id: str) -> None:
 
     await _emit_state_change(appt, "ended", 0, [], now)
 
+def get_call_coordination_keys(appointment_id: str) -> list[str]:
+    return [
+        _disconnect_key(appointment_id),
+        RedisKeys.join_lock(appointment_id),
+        RedisKeys.call_version(appointment_id),
+        RedisKeys.epoch_key(appointment_id, "doctor"),
+        RedisKeys.epoch_key(appointment_id, "patient"),
+        RedisKeys.call_leader(appointment_id, "doctor"),
+        RedisKeys.call_leader(appointment_id, "patient"),
+        RedisKeys.active_token(appointment_id, "doctor"),
+        RedisKeys.active_token(appointment_id, "patient"),
+        RedisKeys.prev_token(appointment_id, "doctor"),
+        RedisKeys.prev_token(appointment_id, "patient"),
+        RedisKeys.call_state(appointment_id),
+        RedisKeys.call_created_at(appointment_id),
+        RedisKeys.reconcile_cooldown(appointment_id),
+        RedisKeys.kill_switch(appointment_id),
+        RedisKeys.last_seen_key(appointment_id, "doctor"),
+        RedisKeys.last_seen_key(appointment_id, "patient"),
+        RedisKeys.last_ts_key(appointment_id, "doctor"),
+        RedisKeys.last_ts_key(appointment_id, "patient"),
+        f"{RedisKeys.join_lock(appointment_id)}:counter"
+    ]
+
 async def cleanup_call_resources(appointment_id: str, doctor_id: str | None, room_name: str | None) -> None:
     """Helper to clean up LiveKit room and Redis keys."""
     redis = get_redis()
-    await redis.delete(_disconnect_key(appointment_id))
-    await redis.delete(RedisKeys.call_version(appointment_id))
+    keys = get_call_coordination_keys(appointment_id)
+    try:
+        await redis.delete(*keys)
+    except Exception as e:
+        logger.warning("cleanup_call_resources: failed to delete some Redis keys: %s", str(e))
+
     if doctor_id:
         await _clear_heartbeat(redis, appointment_id, doctor_id)
     
@@ -1075,7 +1111,7 @@ async def handle_participant_timeout(appointment_id: str, role: str) -> dict[str
 
 # ─── Final Safety and Telemetry Helpers ───────────────────────
 
-async def transition_call_redis_state(redis, appointment_id: str, next_state: str) -> bool:
+async def transition_call_redis_state(redis, appointment_id: str, next_state: str, version: int | None = None) -> bool:
     """Validate and transition call state in Redis to ensure Mongo/Redis consistency."""
     safe_redis = SafeRedis(redis)
     key = RedisKeys.call_state(appointment_id)
@@ -1092,6 +1128,8 @@ async def transition_call_redis_state(redis, appointment_id: str, next_state: st
             curr_state_str = "idle"
             
         if curr_state_str == next_state:
+            if version is not None:
+                await redis.hset(key, "version", str(version))
             return True
             
         allowed = allowed_transitions.get(curr_state_str, set())
@@ -1099,10 +1137,13 @@ async def transition_call_redis_state(redis, appointment_id: str, next_state: st
             logger.warning("Redis FSM: Invalid transition from %s to %s for appointment %s", curr_state_str, next_state, appointment_id)
             return False
             
-        version = await redis.hincrby(key, "version", 1)
-        await redis.hset(key, mapping={"state": next_state, "version": str(version)})
+        mapping = {"state": next_state}
+        if version is not None:
+            mapping["version"] = str(version)
+            
+        await redis.hset(key, mapping=mapping)
         await redis.expire(key, 7200) # 2 hours TTL
-        logger.info("Redis FSM: Transitioned %s → %s (v%d) for appointment %s", curr_state_str, next_state, version, appointment_id)
+        logger.info("Redis FSM: Transitioned %s → %s for appointment %s", curr_state_str, next_state, appointment_id)
         return True
     except Exception as exc:
         logger.warning("Redis FSM: Error transitioning state to %s for appointment %s: %s", next_state, appointment_id, str(exc))
