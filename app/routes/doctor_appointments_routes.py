@@ -1250,7 +1250,7 @@ async def doctor_call_heartbeat(
         raise HTTPException(status_code=409, detail="Outdated session version")
 
     # 7. Epoch Fencing & Timeout Check
-    leader_key = RedisKeys.call_leader(appointment_id)
+    leader_key = RedisKeys.call_leader(appointment_id, "doctor")
     terminate = False
     terminate_reason = "none"
     leader_epoch = epoch if epoch is not None else 1

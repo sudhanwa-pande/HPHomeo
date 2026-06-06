@@ -1765,8 +1765,9 @@ async def patient_call_heartbeat(
         raise HTTPException(status_code=409, detail="Outdated session version")
 
     # 7. Epoch Fencing & Timeout Check
-    leader_key = RedisKeys.call_leader(appointment_id)
+    leader_key = RedisKeys.call_leader(appointment_id, "patient")
     terminate = False
+    terminate_reason = "none"
     leader_epoch = epoch if epoch is not None else 1
     is_zombie = False
     media_policy = "normal"
@@ -1774,6 +1775,7 @@ async def patient_call_heartbeat(
     if db_call_status == "ended":
         logger.warning("patient_heartbeat_call_already_ended: appt_id=%s", appointment_id)
         terminate = True
+        terminate_reason = "call_already_ended"
 
     if authority_mode != "mongo":
         # 7a. Control-Plane Kill Switch verification key check
@@ -1781,6 +1783,7 @@ async def patient_call_heartbeat(
             if await redis.get_str(RedisKeys.kill_switch(appointment_id)):
                 logger.warning("call_kill_switch_triggered_heartbeat: appt_id=%s", appointment_id)
                 terminate = True
+                terminate_reason = "kill_switch"
         except Exception as exc:
             logger.warning("Failed to check control plane kill switch: %s", str(exc))
 
@@ -1798,6 +1801,7 @@ async def patient_call_heartbeat(
                         if appt and appt.get("video_room"):
                             await handle_room_finished(appt["video_room"])
                         terminate = True
+                        terminate_reason = "hard_timeout"
             except Exception as exc:
                 logger.warning("Failed to check hard timeout on heartbeat: %s", str(exc))
 
