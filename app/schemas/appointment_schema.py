@@ -154,7 +154,7 @@ class PublicAppointmentView(BaseModel):
     payment_choice: Literal["pay_now", "pay_at_clinic"]
     consultation_fee: Optional[int] = None
     video_enabled: bool = False
-    call_status: Literal["idle", "waiting", "initializing", "connected", "disconnected", "ended"] = "idle"
+    call_status: Literal["idle", "waiting", "connected", "disconnected", "ended"] = "idle"
 
     # Useful for UI
     appointment_type: AppointmentType = "new"
@@ -162,6 +162,14 @@ class PublicAppointmentView(BaseModel):
     can_cancel: bool = False
     can_reschedule: bool = False
     cancel_window_hours: int = 2
+
+
+def normalize_call_status(status: str) -> Literal["idle", "waiting", "connected", "disconnected", "ended"]:
+    allowed = {"idle", "waiting", "connected", "disconnected", "ended"}
+    if status not in allowed:
+        return "waiting"
+    # Type cast technically safe here because of the 'in allowed' check
+    return status # type: ignore
 
 
 # -----------------------------

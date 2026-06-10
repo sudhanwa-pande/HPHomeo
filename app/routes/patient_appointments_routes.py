@@ -62,6 +62,7 @@ from app.services.event_bus import (
     EVENT_APPOINTMENT_CANCELLED,
     EVENT_APPOINTMENT_RESCHEDULED,
 )
+from app.schemas.appointment_schema import normalize_call_status
 
 router = APIRouter(prefix="/patient", tags=["Patient Appointments"])
 
@@ -87,7 +88,7 @@ def _appt_to_patient_out(a: dict) -> dict:
         "consultation_fee": a.get("consultation_fee"),
 
         "video_enabled": a.get("video_enabled", False),
-        "call_status": a.get("call_status", "idle"),
+        "call_status": normalize_call_status(a.get("call_status", "idle")),
 
         "cancel_reason": a.get("cancel_reason"),
         "cancelled_at": cancelled_at.isoformat() if cancelled_at else None,

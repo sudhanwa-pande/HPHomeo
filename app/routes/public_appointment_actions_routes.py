@@ -18,6 +18,7 @@ from app.schemas.appointment_schema import (
     PaymentVerifyIn,
     PublicAppointmentAccessIn,
     PublicAppointmentView,
+    normalize_call_status,
 )
 from app.services.payment_order_service import create_payment_order_for_appointment, verify_payment_signature_and_confirm
 from app.services.refund_service import enqueue_refund_processing
@@ -183,7 +184,7 @@ async def view_public_appointment(
         "payment_choice": appointment["payment_choice"],
         "consultation_fee": appointment.get("consultation_fee"),
         "video_enabled": appointment.get("video_enabled", False),
-        "call_status": appointment.get("call_status", "idle"),
+        "call_status": normalize_call_status(appointment.get("call_status", "idle")),
         "appointment_type": appointment.get("appointment_type", "new"),
         "follow_up_of_appointment_id": (
             str(appointment["follow_up_of_appointment_id"])

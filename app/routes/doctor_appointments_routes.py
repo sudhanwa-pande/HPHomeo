@@ -31,12 +31,13 @@ from app.services.call_state_machine import (
     handle_manual_end,
 )
 from app.utils.appointment_serializers import _review_out
+from app.schemas.appointment_schema import normalize_call_status
 from app.utils.clinic import clinic_profile_fields
 from app.utils.time import day_window_to_utc, ensure_utc, utc_now
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/doctor", tags=["Doctor Appointments"])
+router = APIRouter(prefix="/doctor", tags=["doctor-appointments"])
 
 
 VISIBLE_TO_DOCTOR_STATUSES = [
@@ -325,7 +326,7 @@ def _serialize_doctor_appointment(
         "status": a.get("status"),
         "prescription_status": prescription_status,
         "video_enabled": a.get("video_enabled", False),
-        "call_status": a.get("call_status", "idle"),
+        "call_status": normalize_call_status(a.get("call_status", "idle")),
         "confirmed_at": _iso_utc(a.get("confirmed_at")),
         "cancel_reason": a.get("cancel_reason"),
         "cancelled_at": _iso_utc(a.get("cancelled_at")),
