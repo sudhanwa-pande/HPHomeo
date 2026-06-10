@@ -141,6 +141,7 @@ async def handle_participant_joined(
     identity: str,
     role: str,
     participant_sid: str,
+    room_sid: str = None
 ) -> dict[str, Any] | None:
     """Handle a LiveKit participant_joined webhook.
 
@@ -183,7 +184,8 @@ async def handle_participant_joined(
             "$set": {
                 f"{role}_participant": participant_obj,
                 "updated_at": now,
-                "call_last_activity_at": now
+                "call_last_activity_at": now,
+                **({"video_room_sid": room_sid} if room_sid else {})
             }
         },
         return_document=ReturnDocument.AFTER
@@ -361,7 +363,7 @@ async def handle_participant_left(
     return final_appt
 
 
-async def handle_room_finished(room_name: str) -> None:
+async def handle_room_finished(room_name: str, room_sid: str = None) -> None:
     """Handle a LiveKit room_finished webhook — all participants gone, room closed."""
     db = get_db()
     now = utc_now()
@@ -369,6 +371,10 @@ async def handle_room_finished(room_name: str) -> None:
     appt = await db.appointments.find_one({"video_room": room_name})
     if not appt:
         logger.debug("handle_room_finished: no appointment for room=%s", room_name)
+        return
+        
+    if room_sid and appt.get("video_room_sid") and appt.get("video_room_sid") != room_sid:
+        logger.info("handle_room_finished: ignoring stale webhook for room=%s. Expected sid=%s, got sid=%s", room_name, appt.get("video_room_sid"), room_sid)
         return
 
     current_state = appt.get("call_status", "idle")
@@ -923,13 +929,35 @@ async def get_calls_dashboard(doctor_id: str, day: str) -> dict[str, Any]:
             )
             disconnected.append(serialized)
         elif call_status == "waiting" or appt_id in waiting_appt_ids:
-            # Add waiting_since from heartbeat data if available
             hb_match = next((w for w in waiting_heartbeat if w["appointment_id"] == appt_id), None)
-            serialized["waiting_since"] = (
-                hb_match["waiting_since"] if hb_match else
-                (a["patient_joined_at"].isoformat() if a.get("patient_joined_at") else None)
-            )
-            waiting.append(serialized)
+            
+            # Check if patient is truly active to prevent false "waiting" notifications
+            is_active_patient = False
+            if hb_match:
+                is_active_patient = True
+            else:
+                import time
+                from app.core.redis import get_safe_redis
+                from app.utils.redis_utils import RedisKeys
+                redis_safe = get_safe_redis()
+                last_seen_str = await redis_safe.get_str(RedisKeys.last_seen_key(appt_id, "patient"))
+                if last_seen_str:
+                    try:
+                        if time.time() - float(last_seen_str) < 30.0:
+                            is_active_patient = True
+                    except Exception:
+                        pass
+            
+            if is_active_patient:
+                serialized["waiting_since"] = (
+                    hb_match["waiting_since"] if hb_match else
+                    (a["patient_joined_at"].isoformat() if a.get("patient_joined_at") else None)
+                )
+                waiting.append(serialized)
+            elif a.get("status") in ("confirmed", "pending_payment"):
+                # If call_status is "waiting" but patient is not active, downgrade to scheduled
+                scheduled.append(serialized)
+            
         elif call_status == "idle" and a.get("status") in ("confirmed", "pending_payment"):
             scheduled.append(serialized)
         # "ended" appointments are not shown in any active section

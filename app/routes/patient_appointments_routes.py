@@ -1757,13 +1757,38 @@ async def patient_call_heartbeat(
         except Exception as exc:
             logger.warning("Redis rehydration failed: %s", str(exc))
 
-    # 6. Validate session version if provided (Strict clock check: incoming >= db_version)
-    if incoming_version is not None and incoming_version < db_version:
-        logger.warning(
-            "patient_heartbeat_session_version_mismatch: db=%s incoming=%s appt_id=%s",
-            db_version, incoming_version, appointment_id
-        )
-        raise HTTPException(status_code=409, detail="Outdated session version")
+    # 6. Validate session version if provided (Strict equality check)
+    if incoming_version is not None:
+        stored_version_str = await redis.get_str(RedisKeys.session_version_key(appointment_id, "patient"))
+        stored_version = int(stored_version_str) if stored_version_str else db_version
+        if incoming_version != stored_version:
+            logger.info(
+                "METRIC event=heartbeat_ignored action=ignored reason=session_version_mismatch db=%s incoming=%s appt_id=%s role=patient session_id=%s",
+                stored_version, incoming_version, appointment_id, session_id or ""
+            )
+            return {
+                "status": "ok",
+                "call_status": db_call_status,
+                "session_version": db_version,
+                "ignored": True,
+                "server_time": time.time()
+            }
+
+    # 6b. First Heartbeat (seq=0) Idempotent Initialization
+    if session_id and seq == 0 and authority_mode == "redis":
+        init_key = RedisKeys.init_key(appointment_id, "patient", session_id)
+        try:
+            is_new = await redis.redis.setnx(init_key, "1")
+            if is_new:
+                await redis.redis.expire(init_key, 120)
+                now = time.time()
+                await redis.redis.setex(RedisKeys.last_seen_key(appointment_id, "patient"), 120, str(now))
+                if incoming_version is not None:
+                    await redis.redis.setex(RedisKeys.session_version_key(appointment_id, "patient"), 120, str(incoming_version))
+                kill_version_key = RedisKeys.kill_version_key(appointment_id, "patient", session_id)
+                await redis.redis.setex(kill_version_key, 120, str(int(now * 1000)))
+        except Exception as exc:
+            logger.warning("Failed seq=0 initialization: %s", str(exc))
 
     # 7. Epoch Fencing & Timeout Check
     leader_key = RedisKeys.call_leader(appointment_id, "patient")
@@ -1781,10 +1806,16 @@ async def patient_call_heartbeat(
     if authority_mode != "mongo":
         # 7a. Control-Plane Kill Switch verification key check
         try:
-            if await redis.get_str(RedisKeys.kill_switch(appointment_id)):
-                logger.warning("call_kill_switch_triggered_heartbeat: appt_id=%s", appointment_id)
-                terminate = True
-                terminate_reason = "kill_switch"
+            kill_ts_str = await redis.get_str(RedisKeys.kill_switch(appointment_id))
+            if kill_ts_str:
+                kill_version_key = RedisKeys.kill_version_key(appointment_id, "patient", session_id)
+                stored_kill_version_str = await redis.get_str(kill_version_key)
+                stored_kill_version = int(stored_kill_version_str) if stored_kill_version_str else 0
+                incoming_kill_ts = int(kill_ts_str) if kill_ts_str.isdigit() else 0
+                if incoming_kill_ts >= stored_kill_version:
+                    logger.warning("call_kill_switch_triggered_heartbeat: appt_id=%s", appointment_id)
+                    terminate = True
+                    terminate_reason = "kill_switch"
         except Exception as exc:
             logger.warning("Failed to check control plane kill switch: %s", str(exc))
 
@@ -1808,7 +1839,7 @@ async def patient_call_heartbeat(
 
         # 7c. Heartbeat Silence Timeout Check with degraded grace tiers
         last_seen_key = RedisKeys.last_seen_key(appointment_id, "patient")
-        if not terminate and token_id:
+        if not terminate and token_id and seq != 0:
             try:
                 last_seen_str = await redis.get_str(last_seen_key)
                 if last_seen_str:
@@ -1949,7 +1980,7 @@ async def patient_call_heartbeat(
 
     # structured tracing metric log
     logger.info(
-        "METRIC event=%s session_id=%s token_id=%s authority_version=%d role=%s leader_session_id=%s trace_id=%s",
+        "METRIC event=%s action=accepted session_id=%s token_id=%s authority_version=%d role=%s leader_session_id=%s trace_id=%s",
         "heartbeat", session_id or "", token_id or "", db_version, "patient", leader_session_id, token_id or ""
     )
 

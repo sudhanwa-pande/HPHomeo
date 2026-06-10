@@ -172,8 +172,8 @@ async def livekit_webhook(request: Request, background_tasks: BackgroundTasks):
             return {"status": "ignored"} # codeql[py/clear-text-logging-sensitive-data]
 
         role = _extract_role_from_identity(identity)
-        logger.info("participant_joined webhook: appointment_id=%s role=%s trace_id=%s", appointment_id, role, trace_id)
-        await handle_participant_joined(appointment_id, identity, role, participant_sid)
+        logger.info("participant_joined webhook: appointment_id=%s role=%s trace_id=%s room_sid=%s", appointment_id, role, trace_id, room_sid)
+        await handle_participant_joined(appointment_id, identity, role, participant_sid, room_sid)
         return {"status": "ok"}
 
     elif event == "participant_left":
@@ -187,11 +187,11 @@ async def livekit_webhook(request: Request, background_tasks: BackgroundTasks):
         return {"status": "ok"}
 
     elif event == "room_finished":
-        if not room_name: # codeql[py/clear-text-logging-sensitive-data]
+        if not room_name or not room_sid:
             return {"status": "ignored"}
 
-        logger.info("room_finished webhook: room=%s appointment_id=%s trace_id=%s", room_name, appointment_id, trace_id)
-        await handle_room_finished(room_name)
+        logger.info("room_finished webhook: room=%s room_sid=%s appointment_id=%s trace_id=%s", room_name, room_sid, appointment_id, trace_id)
+        await handle_room_finished(room_name, room_sid)
         return {"status": "ok"}
 
     else:

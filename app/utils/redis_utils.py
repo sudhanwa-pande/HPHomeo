@@ -108,6 +108,18 @@ class RedisKeys:
     def last_ts_key(app_id: str, role: str) -> str:
         return f"call:last_ts:{app_id}:{role}"
 
+    @staticmethod
+    def session_version_key(app_id: str, role: str) -> str:
+        return f"call:session_version:{app_id}:{role}"
+
+    @staticmethod
+    def kill_version_key(app_id: str, role: str, session_id: str) -> str:
+        return f"call:kill_version:{app_id}:{role}:{session_id}"
+
+    @staticmethod
+    def init_key(app_id: str, role: str, session_id: str) -> str:
+        return f"call:init:{app_id}:{role}:{session_id}"
+
 def ensure_str(value: Any) -> str | None:
     if value is None:
         return None
