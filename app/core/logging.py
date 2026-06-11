@@ -94,7 +94,11 @@ def setup_logging():
         logger.add(json_serializer, enqueue=True)
 
     # Overwrite the standard logging configuration
-    logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
+    logging.basicConfig(handlers=[InterceptHandler()], level=logging.INFO, force=True)
+
+    # Silence verbose pymongo and motor driver logs
+    logging.getLogger("pymongo").setLevel(logging.WARNING)
+    logging.getLogger("motor").setLevel(logging.WARNING)
 
     # Disable default uvicorn handlers to prevent log duplication
     for logger_name in ("uvicorn", "uvicorn.asgi", "uvicorn.access", "uvicorn.error"):
