@@ -446,7 +446,7 @@ async def reconcile_call_state(appointment_id: str) -> dict[str, Any] | None:
         return appt
 
     cooldown_key = RedisKeys.reconcile_cooldown(appointment_id)
-    if await redis.get(cooldown_key):
+    if await redis.get_str(cooldown_key):
         logger.info("reconcile_call_state: skipping due to cooldown for appointment_id=%s", appointment_id)
         return appt
 
@@ -1130,9 +1130,9 @@ async def transition_call_redis_state(redis, appointment_id: str, next_state: st
     key = RedisKeys.call_state(appointment_id)
     allowed_transitions = {
         "idle": {"connecting"},
-        "connecting": {"active", "ended"},
-        "active": {"ending", "ended"},
-        "ending": {"ended"},
+        "connecting": {"active", "ended", "connecting"},
+        "active": {"ending", "ended", "connecting"},
+        "ending": {"ended", "connecting", "active"},
         "ended": set()
     }
     try:
@@ -1157,6 +1157,18 @@ async def transition_call_redis_state(redis, appointment_id: str, next_state: st
         await redis.hset(key, mapping=mapping)
         await redis.expire(key, 7200) # 2 hours TTL
         logger.info("Redis FSM: Transitioned %s → %s for appointment %s", curr_state_str, next_state, appointment_id)
+
+        # Clean up disconnect timeout key when recovering from ending state.
+        # The Celery enforce_disconnect_timeout task has its own Mongo guard
+        # (checks call_status=="disconnected"), but clearing the Redis key
+        # avoids unnecessary task execution and stale state.
+        if curr_state_str == "ending" and next_state in ("connecting", "active"):
+            try:
+                await redis.delete(_disconnect_key(appointment_id))
+                logger.info("Redis FSM: Cleared disconnect timeout key for appointment %s (re-entry from ending)", appointment_id)
+            except Exception as cleanup_exc:
+                logger.warning("Redis FSM: Failed to clear disconnect key for appointment %s: %s", appointment_id, str(cleanup_exc))
+
         return True
     except Exception as exc:
         logger.warning("Redis FSM: Error transitioning state to %s for appointment %s: %s", next_state, appointment_id, str(exc))
