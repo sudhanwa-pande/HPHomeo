@@ -147,6 +147,7 @@ async def livekit_webhook(request: Request, background_tasks: BackgroundTasks):
 
     room = payload.get("room", {})
     room_name = room.get("name", "")
+    room_sid = room.get("sid", "")
     participant = payload.get("participant", {})
     identity = participant.get("identity", "")
     participant_sid = participant.get("sid", "")
