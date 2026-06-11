@@ -127,10 +127,37 @@ app.add_middleware(CSRFMiddleware)
 
 @app.middleware("http")
 async def request_id_and_security_headers(request: Request, call_next):
+    import time
+    from loguru import logger
+    from app.core.logging import (
+        request_id_context,
+        request_path_context,
+        request_method_context,
+        request_duration_context,
+    )
+
     request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
     request.state.request_id = request_id
 
-    response = await call_next(request)
+    start_time = time.time()
+    token_id = request_id_context.set(request_id)
+    token_path = request_path_context.set(request.url.path)
+    token_method = request_method_context.set(request.method)
+
+    try:
+        response = await call_next(request)
+        duration_ms = (time.time() - start_time) * 1000
+        request_duration_context.set(duration_ms)
+        logger.info("request_completed status_code=%s duration_ms=%s", response.status_code, round(duration_ms, 2))
+    except Exception as e:
+        duration_ms = (time.time() - start_time) * 1000
+        request_duration_context.set(duration_ms)
+        logger.error("request_failed error=%s duration_ms=%s", str(e), round(duration_ms, 2))
+        raise e
+    finally:
+        request_id_context.reset(token_id)
+        request_path_context.reset(token_path)
+        request_method_context.reset(token_method)
 
     response.headers["X-Request-ID"] = request_id
     response.headers["X-Content-Type-Options"] = "nosniff"

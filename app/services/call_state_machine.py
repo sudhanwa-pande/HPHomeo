@@ -117,8 +117,6 @@ def _derive_state_from_count(
                 return "disconnected"
             return "idle"
         if participant_count == 1:
-            if current_state == "connected":
-                return "disconnected"
             return "waiting"
         return "connected"  # still >= 2
 
@@ -317,7 +315,7 @@ async def handle_participant_left(
         if count == 0:
             correct_state = "disconnected" if current_state == "connected" else "idle"
         elif count == 1: # codeql[py/clear-text-logging-sensitive-data]
-            correct_state = "disconnected" if current_state == "connected" else "waiting"
+            correct_state = "waiting"
         else:
             correct_state = "connected"
 

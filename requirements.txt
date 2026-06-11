@@ -102,3 +102,5 @@ zope.event==6.1
 zope.interface==8.2
 jinja2==3.1.6
 MarkupSafe==3.0.3
+loguru>=0.7.3
+ruff>=0.1.0
